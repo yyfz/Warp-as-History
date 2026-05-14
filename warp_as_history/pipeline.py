@@ -739,10 +739,54 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         transformer = getattr(self, "transformer", None)
         if transformer is None or not self._wah_has_loaded_adapters():
             return
+        if not enabled:
+            self._unfuse_wah_lora()
         if enabled and hasattr(transformer, "enable_adapters"):
             transformer.enable_adapters()
         elif not enabled and hasattr(transformer, "disable_adapters"):
             transformer.disable_adapters()
+
+    def _wah_lora_is_fused(self) -> bool:
+        transformer = getattr(self, "transformer", None)
+        if transformer is None:
+            return False
+        for module in transformer.modules():
+            if bool(getattr(module, "merged", False)):
+                return True
+        return False
+
+    def _fuse_wah_lora(self) -> bool:
+        transformer = getattr(self, "transformer", None)
+        if transformer is None or not self._wah_has_loaded_adapters():
+            return False
+        if self._wah_lora_is_fused():
+            return True
+
+        self._set_wah_lora_enabled(True)
+        adapter_names = [self._wah_adapter_name]
+        if hasattr(self, "fuse_lora"):
+            try:
+                self.fuse_lora(components=["transformer"], adapter_names=adapter_names)
+            except TypeError:
+                self.fuse_lora(adapter_names=adapter_names)
+            return self._wah_lora_is_fused()
+        if hasattr(transformer, "fuse_lora"):
+            transformer.fuse_lora(adapter_names=adapter_names)
+            return self._wah_lora_is_fused()
+        return False
+
+    def _unfuse_wah_lora(self) -> None:
+        if not self._wah_lora_is_fused():
+            return
+        transformer = getattr(self, "transformer", None)
+        if hasattr(self, "unfuse_lora"):
+            try:
+                self.unfuse_lora(components=["transformer"])
+            except TypeError:
+                self.unfuse_lora()
+            return
+        if transformer is not None and hasattr(transformer, "unfuse_lora"):
+            transformer.unfuse_lora()
 
     def _configure_wah_lora(self, lora_path: str | None) -> bool:
         if lora_path is None:
@@ -2150,7 +2194,12 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         i = 0
         try:
             for i_s in range(pyramid_num_stages):
-                self._set_wah_lora_enabled(bool(state["lora_active"]) and i_s == 0)
+                use_wah_lora = bool(state["lora_active"]) and i_s == 0
+                if use_wah_lora:
+                    if not self._fuse_wah_lora():
+                        self._set_wah_lora_enabled(True)
+                else:
+                    self._set_wah_lora_enabled(False)
 
                 patch_size = self.transformer.config.patch_size
                 image_seq_len = (latents.shape[-1] * latents.shape[-2] * latents.shape[-3]) // (
@@ -2338,6 +2387,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
 
                     i += 1
         finally:
+            self._unfuse_wah_lora()
             self._set_wah_lora_enabled(bool(state["lora_active"]))
 
         total_prev_history = sum(int(x) for x in state.get("prev_chunk_history_sizes", (0, 0, 0)))
