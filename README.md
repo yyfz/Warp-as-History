@@ -221,7 +221,9 @@ Open the printed URL, upload a first frame, enter a prompt, select translation
 and rotation buttons, then click Generate. The server keeps the autoregressive
 state alive between Generate clicks. Generated mp4 files are written under `runs/web_control` by default. 
 
-<video src="assets/webcontrol_demo.mp4" controls muted loop width="100%"></video>
+<a href="assets/webcontrol_demo.mp4">
+  <img src="assets/webcontrol_demo.gif" alt="WebControl demo" width="100%">
+</a>
 
 ## Training
 
