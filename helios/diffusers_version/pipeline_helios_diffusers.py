@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright 2025 The Helios Team and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,10 +27,30 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
-from diffusers.loaders import HeliosLoraLoaderMixin
-from diffusers.models import AutoencoderKLWan, HeliosTransformer3DModel
+try:
+    from diffusers.loaders import HeliosLoraLoaderMixin
+except ImportError:
+    try:
+        from diffusers.loaders import WanLoraLoaderMixin as HeliosLoraLoaderMixin
+    except ImportError:
+        class HeliosLoraLoaderMixin:
+            pass
+from diffusers.models import AutoencoderKLWan
+from .transformer_helios_diffusers import HeliosTransformer3DModel
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.schedulers import HeliosScheduler
+try:
+    from diffusers.schedulers import HeliosScheduler
+except ImportError:
+    from .scheduling_helios_diffusers import HeliosScheduler
+import diffusers as _diffusers
+import diffusers.models as _diffusers_models
+
+_diffusers.HeliosTransformer3DModel = HeliosTransformer3DModel
+_diffusers_models.HeliosTransformer3DModel = HeliosTransformer3DModel
+if not hasattr(_diffusers, "HeliosScheduler"):
+    _diffusers.HeliosScheduler = HeliosScheduler
+if not hasattr(_diffusers, "HeliosDMDScheduler"):
+    _diffusers.HeliosDMDScheduler = HeliosScheduler
 from diffusers.utils import is_ftfy_available, is_torch_xla_available, logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
@@ -161,6 +183,19 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
     _optional_components = ["transformer"]
+
+    @classmethod
+    def _get_signature_types(cls):
+        return {
+            "self": (Any,),
+            "tokenizer": (Any,),
+            "text_encoder": (Any,),
+            "vae": (Any,),
+            "scheduler": (Any,),
+            "transformer": (Any,),
+            "is_cfg_zero_star": (bool,),
+            "is_distilled": (bool,),
+        }
 
     def __init__(
         self,

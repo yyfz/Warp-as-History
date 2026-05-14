@@ -1,4 +1,6 @@
 __pycache__/
 
 /.codex/
+/runs/
+/checkpoints/
 env.sh

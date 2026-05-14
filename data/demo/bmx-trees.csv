@@ -1,0 +1,2 @@
+first_frame_path,prompt,camera_poses_path,warp_video_path,warp_visibility_mask_path
+data/demo/bmx-trees/00000.jpg,"A cyclist riding past a colorful graffiti wall beside trees and tall grass, urban BMX scene, with camera movement.",,data/demo/bmx-trees/warp.mp4,data/demo/bmx-trees/visibility_mask.mp4

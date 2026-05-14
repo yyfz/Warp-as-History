@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
+from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 from safetensors.torch import load_file, save_file
 
@@ -22,8 +23,8 @@ from helios.diffusers_version.pipeline_helios_diffusers import (
 
 from .camera_warp import (
     CAMERA_CONTROL_DEFAULT_MESH_BREAK_MODE,
-    CAMERA_CONTROL_DEFAULT_MOGE_DEPTH_RTOL,
-    CAMERA_CONTROL_DEFAULT_MOGE_NORMAL_TOL_DEG,
+    CAMERA_CONTROL_DEFAULT_MESH_DEPTH_RTOL,
+    CAMERA_CONTROL_DEFAULT_MESH_NORMAL_TOL_DEG,
     CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY,
     CAMERA_CONTROL_DEFAULT_TRANSLATION_SCALE,
     CAMERA_CONTROL_DEFAULT_TRANSLATION_SCALE_USE_FIRST_FRAME_DEPTH,
@@ -83,6 +84,20 @@ def _normalize_history_sizes(history_sizes: list[int] | tuple[int, int, int], na
     return normalized
 
 
+def _checkpoint_model_path(value: str | Path, *, label: str) -> str:
+    repo_root = Path(__file__).resolve().parents[1]
+    checkpoints_root = Path(str((repo_root / "checkpoints").absolute()))
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = repo_root / path
+    path = Path(str(path.absolute()))
+    if not path.is_relative_to(checkpoints_root):
+        raise ValueError(f"{label} must be under {checkpoints_root}, got {path}")
+    if not path.is_dir():
+        raise FileNotFoundError(f"Missing {label} directory: {path}. Run `python scripts/check_models.py`.")
+    return str(path)
+
+
 class WarpAsHistoryPipeline(HeliosPipeline):
     """Minimal Warp-as-History inference pipeline.
 
@@ -94,6 +109,14 @@ class WarpAsHistoryPipeline(HeliosPipeline):
     _wah_adapter_name = "wah"
     _camera_warp_renderer: Pi3XWarpRenderer | None = None
     _camera_warp_renderer_key: tuple[Any, ...] | None = None
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str | Path, *args: Any, **kwargs: Any):
+        model_path = _checkpoint_model_path(
+            pretrained_model_name_or_path,
+            label="pretrained_model_name_or_path",
+        )
+        return super().from_pretrained(model_path, *args, **kwargs)
 
     @staticmethod
     def _add_prompt_trigger(
@@ -335,6 +358,10 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         visible_token_drop: bool,
         rope_alignment: bool,
         prev_chunk_history_sizes: list[int] | tuple[int, int, int],
+        add_noise_to_warp_latents: bool,
+        warp_noise_sigma_min: float,
+        warp_noise_sigma_max: float,
+        image_history_prefix_noised: bool,
         generator: torch.Generator | list[torch.Generator] | None,
         lora_active: bool,
     ) -> dict[str, Any]:
@@ -346,10 +373,23 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         num_warp_chunks = max(1, (max(int(num_frames), 1) + window_num_frames - 1) // window_num_frames)
         total_warp_frames = num_warp_chunks * window_num_frames
         prev_chunk_history_sizes = _normalize_history_sizes(prev_chunk_history_sizes, "prev_chunk_history_sizes")
-        if sum(prev_chunk_history_sizes) > WAH_NUM_LATENT_FRAMES_PER_CHUNK:
+        history_capacity = int(sum(WAH_HISTORY_SIZES))
+        if sum(prev_chunk_history_sizes) > history_capacity:
             raise ValueError(
                 "sum(prev_chunk_history_sizes) must be <= "
-                f"{WAH_NUM_LATENT_FRAMES_PER_CHUNK}, got {prev_chunk_history_sizes!r}."
+                f"{history_capacity}, got {prev_chunk_history_sizes!r}."
+            )
+        if any(size > cap for size, cap in zip(prev_chunk_history_sizes, WAH_HISTORY_SIZES)):
+            raise ValueError(
+                "prev_chunk_history_sizes cannot exceed the official WAH history slots "
+                f"{WAH_HISTORY_SIZES!r}, got {prev_chunk_history_sizes!r}."
+            )
+        warp_noise_sigma_min = float(warp_noise_sigma_min)
+        warp_noise_sigma_max = float(warp_noise_sigma_max)
+        if warp_noise_sigma_min < 0.0 or warp_noise_sigma_max < warp_noise_sigma_min:
+            raise ValueError(
+                "warp noise sigma range must satisfy 0 <= min <= max, got "
+                f"[{warp_noise_sigma_min}, {warp_noise_sigma_max}]."
             )
 
         source_image = self.video_processor.preprocess(image, height=height, width=width).to(
@@ -396,9 +436,10 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             "height": int(height),
             "num_warp_chunks": num_warp_chunks,
             "prev_chunk_history_sizes": prev_chunk_history_sizes,
-            "prev_chunk_last_latent": None,
-            "prev_chunk_latent_window": None,
+            "prev_history_latent_window": None,
             "prev_chunk_last_frame": None,
+            "warp_history_prefix_latent": None,
+            "warp_latents_tensor": None,
             "source_image": source_image,
             "visibility_mask": visibility_mask,
             "warp_invisible_fill": str(warp_invisible_fill),
@@ -407,6 +448,10 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             "window_num_frames": window_num_frames,
             "visible_token_drop": bool(visible_token_drop),
             "rope_alignment": bool(rope_alignment),
+            "add_noise_to_warp_latents": bool(add_noise_to_warp_latents),
+            "warp_noise_sigma_min": warp_noise_sigma_min,
+            "warp_noise_sigma_max": warp_noise_sigma_max,
+            "image_history_prefix_noised": bool(image_history_prefix_noised),
             "lora_active": bool(lora_active),
             "using_camera_warp": False,
         }
@@ -453,18 +498,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 and pi3x_keyframe_images is not None
                 and len(pi3x_keyframe_images) > 1
             ):
-                condition_intrinsic = None
-                if target_intrinsics is not None:
-                    if isinstance(target_intrinsics, torch.Tensor):
-                        condition_intrinsic = target_intrinsics[0].detach().float().cpu().numpy()
-                    else:
-                        condition_intrinsic = np.asarray(target_intrinsics, dtype=np.float32)[0]
-                else:
-                    condition_intrinsic = state.get("initial_camera_intrinsic")
                 geometry = state["camera_renderer"].estimate_keyframe_geometry(
                     image_tensors=list(pi3x_keyframe_images),
                     device=device,
-                    condition_intrinsic=condition_intrinsic,
                     scale_reference_geometry=state.get("camera_first_frame_geometry"),
                 )
                 state.setdefault("pi3x_keyframe_counts", []).append(int(geometry["keyframe_count"]))
@@ -483,9 +519,6 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 device=device,
                 geometry=geometry,
                 target_intrinsics=target_intrinsics,
-                initial_intrinsic=state.get("initial_camera_intrinsic"),
-                target_intrinsics_policy="prev_pi3x_to_initial",
-                target_intrinsics_blend_to_initial=1.0,
                 chunk_index=int(chunk_index),
                 translation_scale=translation_scale,
                 translation_scale_use_first_frame_depth=use_depth_scale,
@@ -617,35 +650,29 @@ class WarpAsHistoryPipeline(HeliosPipeline):
     def _get_camera_warp_renderer(
         self,
         *,
-        pi3_repo: str | Path | None,
-        pi3x_ckpt: str | Path | None,
         camera_control_warp_render_mode: str,
         camera_control_warp_target_fill_radius: int,
         camera_control_warp_target_fill_min_neighbors: int,
         camera_control_mesh_break_mode: str,
-        camera_control_moge_depth_rtol: float,
-        camera_control_moge_normal_tol_deg: float,
+        camera_control_mesh_depth_rtol: float,
+        camera_control_mesh_normal_tol_deg: float,
     ) -> Pi3XWarpRenderer:
         key = (
-            None if pi3_repo is None else str(Path(pi3_repo).expanduser()),
-            None if pi3x_ckpt is None else str(Path(pi3x_ckpt).expanduser()),
             str(camera_control_warp_render_mode),
             int(camera_control_warp_target_fill_radius),
             int(camera_control_warp_target_fill_min_neighbors),
             str(camera_control_mesh_break_mode),
-            float(camera_control_moge_depth_rtol),
-            float(camera_control_moge_normal_tol_deg),
+            float(camera_control_mesh_depth_rtol),
+            float(camera_control_mesh_normal_tol_deg),
         )
         if self._camera_warp_renderer is None or self._camera_warp_renderer_key != key:
             config = Pi3XWarpRendererConfig(
-                pi3_repo=None if pi3_repo is None else Path(pi3_repo),
-                pi3x_ckpt=None if pi3x_ckpt is None else Path(pi3x_ckpt),
                 render_mode=str(camera_control_warp_render_mode),
                 target_fill_radius=int(camera_control_warp_target_fill_radius),
                 target_fill_min_neighbors=int(camera_control_warp_target_fill_min_neighbors),
                 mesh_break_mode=str(camera_control_mesh_break_mode),
-                moge_depth_rtol=float(camera_control_moge_depth_rtol),
-                moge_normal_tol_deg=float(camera_control_moge_normal_tol_deg),
+                mesh_depth_rtol=float(camera_control_mesh_depth_rtol),
+                mesh_normal_tol_deg=float(camera_control_mesh_normal_tol_deg),
             )
             self._camera_warp_renderer = Pi3XWarpRenderer(config=config)
             self._camera_warp_renderer_key = key
@@ -659,25 +686,81 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return torch.device(device)
 
-    def _build_stage0_histories(
+    def _add_noise_to_warp_history_latents(
         self,
-        latents_history_short: torch.Tensor,
+        state: dict[str, Any],
+        warp_latents: torch.Tensor,
+        device: torch.device,
+        generator: torch.Generator | list[torch.Generator] | None,
+    ) -> torch.Tensor:
+        if not bool(state.get("add_noise_to_warp_latents", True)):
+            return warp_latents
+        noise_sigma_min = float(state.get("warp_noise_sigma_min", 0.111))
+        noise_sigma_max = float(state.get("warp_noise_sigma_max", 0.135))
+        rand_generator = generator[0] if isinstance(generator, list) else generator
+        noisy_chunks = []
+        chunk_size = int(WAH_NUM_LATENT_FRAMES_PER_CHUNK)
+        for chunk_start in range(0, int(warp_latents.shape[2]), chunk_size):
+            latent_chunk = warp_latents[:, :, chunk_start : chunk_start + chunk_size]
+            chunk_frames = int(latent_chunk.shape[2])
+            frame_sigmas = (
+                torch.rand(chunk_frames, device=device, generator=rand_generator)
+                * (noise_sigma_max - noise_sigma_min)
+                + noise_sigma_min
+            ).to(dtype=latent_chunk.dtype)
+            frame_sigmas = frame_sigmas.view(1, 1, chunk_frames, 1, 1)
+            noisy_chunks.append(
+                frame_sigmas
+                * randn_tensor(latent_chunk.shape, generator=generator, device=device, dtype=latent_chunk.dtype)
+                + (1 - frame_sigmas) * latent_chunk
+            )
+        return torch.cat(noisy_chunks, dim=2)
+
+    def _prepare_external_warp_latents(
+        self,
+        state: dict[str, Any],
+        device: torch.device,
+        generator: torch.Generator | list[torch.Generator] | None,
+    ) -> torch.Tensor:
+        cached = state.get("warp_latents_tensor")
+        if cached is not None:
+            return cached.to(device=device, dtype=torch.float32)
+        warp_video_tensor = state["warp_video_tensor"]
+        if warp_video_tensor is None:
+            raise RuntimeError("warp_as_history rollout is missing external warp video.")
+        latents_mean, latents_std = self._latent_stats(device)
+        _, warp_latents_tensor = self.prepare_video_latents(
+            warp_video_tensor.to(device=device, dtype=torch.float32),
+            latents_mean=latents_mean,
+            latents_std=latents_std,
+            num_latent_frames_per_chunk=WAH_NUM_LATENT_FRAMES_PER_CHUNK,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+        warp_latents_tensor = self._add_noise_to_warp_history_latents(
+            state=state,
+            warp_latents=warp_latents_tensor,
+            device=device,
+            generator=generator,
+        )
+        state["warp_latents_tensor"] = warp_latents_tensor.detach()
+        return warp_latents_tensor
+
+    def _build_pyramid_base_histories(
+        self,
         state: dict[str, Any],
         device: torch.device,
         history_dtype: torch.dtype,
-        generator: torch.Generator | None,
+        generator: torch.Generator | list[torch.Generator] | None,
+        base_latents_history_short: torch.Tensor,
     ) -> dict[str, torch.Tensor | None]:
         chunk_index = int(state.get("chunk_index", 0))
         frame_start = chunk_index * int(state["window_num_frames"])
         frame_end = frame_start + int(state["window_num_frames"])
         if chunk_index == 0:
-            source_latent = latents_history_short[:, :, :1].detach().to(device=device, dtype=history_dtype)
             source_frame = state["source_image"].to(device=device, dtype=torch.float32)
         else:
-            source_latent = state.get("prev_chunk_last_latent")
-            if source_latent is None:
-                raise RuntimeError("warp_as_history rollout is missing the previous chunk boundary latent.")
-            source_latent = source_latent.to(device=device, dtype=history_dtype)
             source_frame = state.get("prev_chunk_last_frame")
             if source_frame is None:
                 raise RuntimeError("warp_as_history rollout is missing the previous chunk boundary frame.")
@@ -695,26 +778,72 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             visibility_mask = state["visibility_mask"]
             if warp_video_tensor is None or visibility_mask is None:
                 raise RuntimeError("warp_as_history rollout is missing external warp state.")
-            warp_video_tensor = warp_video_tensor.to(device=device, dtype=torch.float32)
             visibility_mask = visibility_mask.to(device=device, dtype=torch.float32)
             if frame_end > warp_video_tensor.shape[2]:
                 raise RuntimeError(
                     "warp_as_history rollout is missing warp frames for chunk "
                     f"{chunk_index}: need frames [{frame_start}, {frame_end}), got {warp_video_tensor.shape[2]}."
                 )
-            warp_video_chunk = warp_video_tensor[:, :, frame_start:frame_end].clone()
             visibility_chunk = visibility_mask[:, :, frame_start:frame_end].clone()
 
-        latents_mean, latents_std = self._latent_stats(device)
-        _, warp_latents = self.prepare_video_latents(
-            warp_video_chunk,
-            latents_mean=latents_mean,
-            latents_std=latents_std,
-            num_latent_frames_per_chunk=WAH_NUM_LATENT_FRAMES_PER_CHUNK,
-            dtype=torch.float32,
-            device=device,
-            generator=generator,
-        )
+        if base_latents_history_short is None or base_latents_history_short.shape[2] < 1:
+            raise RuntimeError("warp_as_history rollout is missing the official first-frame history prefix.")
+        prefix_latent = base_latents_history_short[:, :, :1].detach().to(device=device, dtype=torch.float32)
+        if bool(state.get("add_noise_to_warp_latents", True)) and not bool(
+            state.get("image_history_prefix_noised", False)
+        ):
+            cached_prefix = state.get("warp_history_prefix_latent")
+            if cached_prefix is None:
+                noise_sigma_min = float(state.get("warp_noise_sigma_min", 0.111))
+                noise_sigma_max = float(state.get("warp_noise_sigma_max", 0.135))
+                rand_generator = generator[0] if isinstance(generator, list) else generator
+                prefix_sigma = (
+                    torch.rand(1, device=device, generator=rand_generator) * (noise_sigma_max - noise_sigma_min)
+                    + noise_sigma_min
+                ).to(dtype=prefix_latent.dtype)
+                prefix_sigma = prefix_sigma.view(1, 1, 1, 1, 1)
+                prefix_latent = (
+                    prefix_sigma
+                    * randn_tensor(prefix_latent.shape, generator=generator, device=device, dtype=prefix_latent.dtype)
+                    + (1 - prefix_sigma) * prefix_latent
+                )
+                state["warp_history_prefix_latent"] = prefix_latent.detach()
+            else:
+                prefix_latent = cached_prefix.to(device=device, dtype=prefix_latent.dtype)
+
+        if state.get("using_camera_warp", False):
+            latents_mean, latents_std = self._latent_stats(device)
+            _, warp_latents = self.prepare_video_latents(
+                warp_video_chunk,
+                latents_mean=latents_mean,
+                latents_std=latents_std,
+                num_latent_frames_per_chunk=WAH_NUM_LATENT_FRAMES_PER_CHUNK,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            warp_latents = self._add_noise_to_warp_history_latents(
+                state=state,
+                warp_latents=warp_latents,
+                device=device,
+                generator=generator,
+            )
+        else:
+            warp_latents_tensor = self._prepare_external_warp_latents(
+                state=state,
+                device=device,
+                generator=generator,
+            )
+            latent_start = chunk_index * WAH_NUM_LATENT_FRAMES_PER_CHUNK
+            latent_end = latent_start + WAH_NUM_LATENT_FRAMES_PER_CHUNK
+            if latent_end > warp_latents_tensor.shape[2]:
+                raise RuntimeError(
+                    "warp_as_history rollout is missing warp latent frames for chunk "
+                    f"{chunk_index}: need latents [{latent_start}, {latent_end}), got {warp_latents_tensor.shape[2]}."
+                )
+            warp_latents = warp_latents_tensor[:, :, latent_start:latent_end].clone()
+
+        prefix_latent = prefix_latent.to(dtype=warp_latents.dtype)
         visibility_latents = self._visibility_mask_to_history_latents(
             visibility_chunk,
             latent_frames=WAH_NUM_LATENT_FRAMES_PER_CHUNK,
@@ -722,113 +851,105 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             latent_width=int(state["width"] // self.vae_scale_factor_spatial),
             temporal_scale=int(self.vae_scale_factor_temporal),
         )
-        if source_latent.shape[0] != warp_latents.shape[0]:
-            raise ValueError("WAH source latent and warp latent batch sizes do not match.")
-
-        zero_history = torch.zeros_like(warp_latents[:, :, :1])
-        indices_hidden_states = torch.arange(12, 21, device=device, dtype=torch.long).unsqueeze(0)
-        indices_latents_history_long = torch.tensor([1], device=device, dtype=torch.long).unsqueeze(0)
-        indices_latents_history_mid = torch.tensor([2], device=device, dtype=torch.long).unsqueeze(0)
-        if state["rope_alignment"]:
-            short_indices = [0, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-        else:
-            short_indices = [0, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        indices_latents_history_short = torch.tensor(short_indices, device=device, dtype=torch.long).unsqueeze(0)
-
-        history_visible_mask_short = None
-        history_visible_mask_mid = None
-        history_visible_mask_long = None
-        if state["visible_token_drop"]:
-            prefix_visible = torch.ones(
-                source_latent.shape[0],
-                1,
-                source_latent.shape[2],
-                source_latent.shape[3],
-                source_latent.shape[4],
-                device=device,
-                dtype=torch.float32,
-            )
-            zero_visible = torch.zeros(
-                zero_history.shape[0],
-                1,
-                zero_history.shape[2],
-                zero_history.shape[3],
-                zero_history.shape[4],
-                device=device,
-                dtype=torch.float32,
-            )
-            history_visible_mask_short = torch.cat([prefix_visible, visibility_latents], dim=2)
-            history_visible_mask_mid = zero_visible
-            history_visible_mask_long = zero_visible
-
-        base_histories = {
-            "indices_hidden_states": indices_hidden_states,
-            "indices_latents_history_short": indices_latents_history_short,
-            "indices_latents_history_mid": indices_latents_history_mid,
-            "indices_latents_history_long": indices_latents_history_long,
-            "latents_history_short": torch.cat([source_latent, warp_latents], dim=2),
-            "latents_history_mid": zero_history,
-            "latents_history_long": zero_history,
-            "history_visible_mask_short": history_visible_mask_short,
-            "history_visible_mask_mid": history_visible_mask_mid,
-            "history_visible_mask_long": history_visible_mask_long,
-        }
-        if chunk_index <= 0:
-            return base_histories
 
         prev_chunk_history_sizes = tuple(int(x) for x in state.get("prev_chunk_history_sizes", (0, 0, 0)))
         total_prev_history = sum(prev_chunk_history_sizes)
-        prev_chunk_latent_window = state.get("prev_chunk_latent_window")
-        if total_prev_history <= 0:
-            return base_histories
-        if prev_chunk_latent_window is None:
-            raise RuntimeError("warp_as_history rollout is missing previous chunk latent history.")
-
-        prev_chunk_latent_window = prev_chunk_latent_window.to(device=device, dtype=history_dtype)
-        if prev_chunk_latent_window.shape[2] < total_prev_history:
-            raise RuntimeError(
-                "warp_as_history rollout is missing enough previous-chunk latent history "
-                f"(need {total_prev_history}, got {prev_chunk_latent_window.shape[2]})."
-            )
-
         long_size, mid_size, short_size = prev_chunk_history_sizes
-        prev_window = prev_chunk_latent_window[:, :, -total_prev_history:]
-        cursor = 0
-        prev_long = prev_window[:, :, cursor : cursor + long_size]
-        cursor += long_size
-        prev_mid = prev_window[:, :, cursor : cursor + mid_size]
-        cursor += mid_size
-        prev_short = prev_window[:, :, cursor : cursor + short_size]
-
-        prev_long_indices = torch.arange(1, 1 + long_size, device=device, dtype=torch.long)
-        prev_mid_indices = torch.arange(1 + long_size, 1 + long_size + mid_size, device=device, dtype=torch.long)
-        prev_short_indices = torch.arange(
-            1 + long_size + mid_size,
-            1 + long_size + mid_size + short_size,
+        official_target_start = 1 + int(sum(WAH_HISTORY_SIZES))
+        hidden_start = official_target_start
+        if not state["rope_alignment"]:
+            hidden_start += WAH_NUM_LATENT_FRAMES_PER_CHUNK
+        indices_hidden_states = torch.arange(
+            hidden_start,
+            hidden_start + WAH_NUM_LATENT_FRAMES_PER_CHUNK,
+            device=device,
+            dtype=torch.long,
+        ).unsqueeze(0)
+        warp_indices = torch.arange(
+            official_target_start,
+            official_target_start + WAH_NUM_LATENT_FRAMES_PER_CHUNK,
             device=device,
             dtype=torch.long,
         )
-        prefix_indices = torch.zeros(1, device=device, dtype=torch.long)
-        warp_indices = indices_latents_history_short.squeeze(0)[1:]
 
-        short_indices_parts = [prefix_indices]
-        short_history_parts = [source_latent]
-        short_visible_parts = [prefix_visible] if state["visible_token_drop"] else None
+        if total_prev_history > 0:
+            prev_window = warp_latents.new_zeros(
+                warp_latents.shape[0],
+                warp_latents.shape[1],
+                total_prev_history,
+                warp_latents.shape[3],
+                warp_latents.shape[4],
+            )
+            prev_visible_window = torch.zeros(
+                warp_latents.shape[0],
+                1,
+                total_prev_history,
+                warp_latents.shape[3],
+                warp_latents.shape[4],
+                device=device,
+                dtype=torch.float32,
+            )
+            prev_history_latent_window = state.get("prev_history_latent_window")
+            if chunk_index > 0:
+                if prev_history_latent_window is None:
+                    raise RuntimeError("warp_as_history rollout is missing previous latent history.")
+                prev_history_latent_window = prev_history_latent_window.to(device=device, dtype=prev_window.dtype)
+                available_history = min(int(prev_history_latent_window.shape[2]), int(total_prev_history))
+                if available_history > 0:
+                    prev_window[:, :, -available_history:] = prev_history_latent_window[:, :, -available_history:]
+                    prev_visible_window[:, :, -available_history:] = 1.0
+            elif short_size > 0 and base_latents_history_short.shape[2] > 1:
+                fake_count = min(int(short_size), int(base_latents_history_short.shape[2] - 1))
+                fake_short = base_latents_history_short[:, :, 1 : 1 + fake_count].detach()
+                fake_short = fake_short.to(device=device, dtype=prev_window.dtype)
+                short_end = int(long_size + mid_size + short_size)
+                short_start = short_end - fake_count
+                prev_window[:, :, short_start:short_end] = fake_short[:, :, -fake_count:]
+                prev_visible_window[:, :, short_start:short_end] = 1.0
+            prev_long, prev_mid, prev_short = prev_window.split(prev_chunk_history_sizes, dim=2)
+            prev_visible_long, prev_visible_mid, prev_visible_short = prev_visible_window.split(
+                prev_chunk_history_sizes,
+                dim=2,
+            )
+            history_start = official_target_start - total_prev_history
+            prev_indices = torch.arange(
+                history_start,
+                history_start + total_prev_history,
+                device=device,
+                dtype=torch.long,
+            )
+            prev_long_indices, prev_mid_indices, prev_short_indices = prev_indices.split(prev_chunk_history_sizes, dim=0)
+        else:
+            prev_long = prev_mid = prev_short = None
+            prev_visible_long = prev_visible_mid = prev_visible_short = None
+            prev_long_indices = prev_mid_indices = prev_short_indices = None
+
+        if prefix_latent.shape[0] != warp_latents.shape[0] or prefix_latent.shape[-2:] != warp_latents.shape[-2:]:
+            raise RuntimeError(
+                "warp_as_history first-frame prefix shape does not match warp history latents: "
+                f"prefix={tuple(prefix_latent.shape)}, warp={tuple(warp_latents.shape)}."
+            )
+
+        short_indices_parts = [torch.zeros(1, device=device, dtype=torch.long)]
+        short_history_parts = [prefix_latent]
+        short_visible_parts = [] if state["visible_token_drop"] else None
+        if short_visible_parts is not None:
+            short_visible_parts.append(
+                torch.ones(
+                    warp_latents.shape[0],
+                    1,
+                    1,
+                    warp_latents.shape[3],
+                    warp_latents.shape[4],
+                    device=device,
+                    dtype=torch.float32,
+                )
+            )
         if short_size > 0:
             short_indices_parts.append(prev_short_indices)
             short_history_parts.append(prev_short)
             if short_visible_parts is not None:
-                short_visible_parts.append(
-                    torch.ones(
-                        prev_short.shape[0],
-                        1,
-                        prev_short.shape[2],
-                        prev_short.shape[3],
-                        prev_short.shape[4],
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                )
+                short_visible_parts.append(prev_visible_short)
         short_indices_parts.append(warp_indices)
         short_history_parts.append(warp_latents)
         if short_visible_parts is not None:
@@ -847,26 +968,10 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             else torch.cat(short_visible_parts, dim=2),
             "history_visible_mask_mid": None
             if not state["visible_token_drop"] or mid_size <= 0
-            else torch.ones(
-                prev_mid.shape[0],
-                1,
-                prev_mid.shape[2],
-                prev_mid.shape[3],
-                prev_mid.shape[4],
-                device=device,
-                dtype=torch.float32,
-            ),
+            else prev_visible_mid,
             "history_visible_mask_long": None
             if not state["visible_token_drop"] or long_size <= 0
-            else torch.ones(
-                prev_long.shape[0],
-                1,
-                prev_long.shape[2],
-                prev_long.shape[3],
-                prev_long.shape[4],
-                device=device,
-                dtype=torch.float32,
-            ),
+            else prev_visible_long,
         }
 
     @torch.no_grad()
@@ -878,8 +983,6 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         *,
         warp_visibility_mask: Any | None = None,
         camera_poses: torch.Tensor | np.ndarray | None = None,
-        pi3_repo: str | Path | None = None,
-        pi3x_ckpt: str | Path | None = None,
         target_intrinsics: torch.Tensor | np.ndarray | None = None,
         lora_path: str | Path | None = None,
         visible_token_drop: bool = True,
@@ -896,6 +999,10 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         return_dict: bool = True,
         num_videos_per_prompt: int = 1,
         add_noise_to_image_latents: bool = False,
+        add_noise_to_warp_latents: bool = True,
+        warp_noise_sigma_min: float = 0.111,
+        warp_noise_sigma_max: float = 0.135,
+        is_amplify_first_chunk: bool = True,
         lora_prompt_trigger: str | None = None,
         prev_chunk_history_sizes: list[int] | tuple[int, int, int] = WAH_PREV_CHUNK_HISTORY_SIZES,
         camera_control_translation_scale: float = CAMERA_CONTROL_DEFAULT_TRANSLATION_SCALE,
@@ -907,8 +1014,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         camera_control_warp_target_fill_radius: int = CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_RADIUS,
         camera_control_warp_target_fill_min_neighbors: int = CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_MIN_NEIGHBORS,
         camera_control_mesh_break_mode: str = CAMERA_CONTROL_DEFAULT_MESH_BREAK_MODE,
-        camera_control_moge_depth_rtol: float = CAMERA_CONTROL_DEFAULT_MOGE_DEPTH_RTOL,
-        camera_control_moge_normal_tol_deg: float = CAMERA_CONTROL_DEFAULT_MOGE_NORMAL_TOL_DEG,
+        camera_control_mesh_depth_rtol: float = CAMERA_CONTROL_DEFAULT_MESH_DEPTH_RTOL,
+        camera_control_mesh_normal_tol_deg: float = CAMERA_CONTROL_DEFAULT_MESH_NORMAL_TOL_DEG,
         camera_control_pi3x_keyframe_memory: bool = CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY,
     ) -> Any:
         using_camera_warp = warp_video is None
@@ -929,14 +1036,12 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 width=int(width),
             ).to(device=device, dtype=torch.float32)
             renderer = self._get_camera_warp_renderer(
-                pi3_repo=pi3_repo,
-                pi3x_ckpt=pi3x_ckpt,
                 camera_control_warp_render_mode=camera_control_warp_render_mode,
                 camera_control_warp_target_fill_radius=camera_control_warp_target_fill_radius,
                 camera_control_warp_target_fill_min_neighbors=camera_control_warp_target_fill_min_neighbors,
                 camera_control_mesh_break_mode=camera_control_mesh_break_mode,
-                camera_control_moge_depth_rtol=float(camera_control_moge_depth_rtol),
-                camera_control_moge_normal_tol_deg=float(camera_control_moge_normal_tol_deg),
+                camera_control_mesh_depth_rtol=float(camera_control_mesh_depth_rtol),
+                camera_control_mesh_normal_tol_deg=float(camera_control_mesh_normal_tol_deg),
             )
             first_chunk_intrinsics = self._slice_frame_sequence(
                 target_intrinsics,
@@ -999,16 +1104,14 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             visible_token_drop=bool(visible_token_drop),
             rope_alignment=bool(rope_alignment),
             prev_chunk_history_sizes=prev_chunk_history_sizes,
+            add_noise_to_warp_latents=bool(add_noise_to_warp_latents),
+            warp_noise_sigma_min=float(warp_noise_sigma_min),
+            warp_noise_sigma_max=float(warp_noise_sigma_max),
+            image_history_prefix_noised=bool(add_noise_to_image_latents),
             generator=generator,
             lora_active=bool(lora_active),
         )
         if using_camera_warp:
-            if first_chunk_intrinsics is None:
-                initial_camera_intrinsic = np.asarray(camera_first_chunk_rendered["geometry"]["intrinsic"], dtype=np.float32)
-            elif isinstance(first_chunk_intrinsics, torch.Tensor):
-                initial_camera_intrinsic = first_chunk_intrinsics[0].detach().float().cpu().numpy().astype(np.float32)
-            else:
-                initial_camera_intrinsic = np.asarray(first_chunk_intrinsics, dtype=np.float32)[0]
             self._wah_state.update(
                 {
                     "using_camera_warp": True,
@@ -1017,7 +1120,6 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                     "target_intrinsics": target_intrinsics,
                     "camera_first_chunk_rendered": camera_first_chunk_rendered,
                     "camera_first_frame_geometry": camera_first_chunk_rendered["geometry"],
-                    "initial_camera_intrinsic": initial_camera_intrinsic.copy(),
                     "camera_translation_effective_scale": float(
                         camera_first_chunk_rendered.get(
                             "camera_translation_effective_scale",
@@ -1098,7 +1200,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 pyramid_num_inference_steps_list=list(WAH_PYRAMID_STEPS),
                 use_zero_init=False,
                 zero_steps=0,
-                is_amplify_first_chunk=False,
+                is_amplify_first_chunk=bool(is_amplify_first_chunk),
             )
         finally:
             self.vae.decode = original_vae_decode
@@ -1232,26 +1334,28 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                         start_point_list.append(latents)
 
                 if i_s == 0:
-                    stage0_histories = self._build_stage0_histories(
-                        latents_history_short=latents_history_short,
+                    pyramid_base_histories = self._build_pyramid_base_histories(
                         state=state,
                         device=device,
                         history_dtype=latents_history_short.dtype,
                         generator=generator,
+                        base_latents_history_short=latents_history_short,
                     )
 
                 for idx, t in enumerate(timesteps):
                     if i_s == 0:
-                        current_indices_hidden_states = stage0_histories["indices_hidden_states"]
-                        current_indices_latents_history_short = stage0_histories["indices_latents_history_short"]
-                        current_indices_latents_history_mid = stage0_histories["indices_latents_history_mid"]
-                        current_indices_latents_history_long = stage0_histories["indices_latents_history_long"]
-                        current_latents_history_short = stage0_histories["latents_history_short"]
-                        current_latents_history_mid = stage0_histories["latents_history_mid"]
-                        current_latents_history_long = stage0_histories["latents_history_long"]
-                        current_history_visible_mask_short = stage0_histories["history_visible_mask_short"]
-                        current_history_visible_mask_mid = stage0_histories["history_visible_mask_mid"]
-                        current_history_visible_mask_long = stage0_histories["history_visible_mask_long"]
+                        current_indices_hidden_states = pyramid_base_histories["indices_hidden_states"]
+                        current_indices_latents_history_short = pyramid_base_histories[
+                            "indices_latents_history_short"
+                        ]
+                        current_indices_latents_history_mid = pyramid_base_histories["indices_latents_history_mid"]
+                        current_indices_latents_history_long = pyramid_base_histories["indices_latents_history_long"]
+                        current_latents_history_short = pyramid_base_histories["latents_history_short"]
+                        current_latents_history_mid = pyramid_base_histories["latents_history_mid"]
+                        current_latents_history_long = pyramid_base_histories["latents_history_long"]
+                        current_history_visible_mask_short = pyramid_base_histories["history_visible_mask_short"]
+                        current_history_visible_mask_mid = pyramid_base_histories["history_visible_mask_mid"]
+                        current_history_visible_mask_long = pyramid_base_histories["history_visible_mask_long"]
                     else:
                         current_indices_hidden_states = indices_hidden_states
                         current_indices_latents_history_short = indices_latents_history_short
@@ -1363,7 +1467,13 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         finally:
             self._set_wah_lora_enabled(bool(state["lora_active"]))
 
-        state["prev_chunk_last_latent"] = latents[:, :, -1:].detach()
-        state["prev_chunk_latent_window"] = latents.detach()
+        total_prev_history = sum(int(x) for x in state.get("prev_chunk_history_sizes", (0, 0, 0)))
+        if total_prev_history > 0:
+            prev_history = state.get("prev_history_latent_window")
+            current_history = latents.detach()
+            if prev_history is not None:
+                prev_history = prev_history.to(device=current_history.device, dtype=current_history.dtype)
+                current_history = torch.cat([prev_history, current_history], dim=2)
+            state["prev_history_latent_window"] = current_history[:, :, -total_prev_history:].detach()
         state["chunk_index"] = int(state.get("chunk_index", 0)) + 1
         return latents

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,9 +37,9 @@ CAMERA_CONTROL_WARP_RENDER_MODES = frozenset({"splat", "target_fill"})
 CAMERA_CONTROL_DEFAULT_WARP_RENDER_MODE = "target_fill"
 CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_RADIUS = 1
 CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_MIN_NEIGHBORS = 4
-CAMERA_CONTROL_DEFAULT_MESH_BREAK_MODE = "moge_depth_normal"
-CAMERA_CONTROL_DEFAULT_MOGE_DEPTH_RTOL = 0.03
-CAMERA_CONTROL_DEFAULT_MOGE_NORMAL_TOL_DEG = 5.0
+CAMERA_CONTROL_DEFAULT_MESH_BREAK_MODE = "depth_normal"
+CAMERA_CONTROL_DEFAULT_MESH_DEPTH_RTOL = 0.03
+CAMERA_CONTROL_DEFAULT_MESH_NORMAL_TOL_DEG = 5.0
 CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY = True
 CAMERA_CONTROL_PI3X_KEYFRAME_PREVIOUS_MESH_SAMPLES_PER_AXIS = 1
 CAMERA_CONTROL_KEYFRAME_BACKGROUND_ATLAS_HEIGHT = 384
@@ -52,18 +51,14 @@ CAMERA_CONTROL_PI3X_KEYFRAME_FOCAL_CLAMP_MAX = 1.35
 CAMERA_CONTROL_PI3X_KEYFRAME_FOCAL_SMOOTH_ALPHA = 0.5
 CAMERA_CONTROL_PI3X_KEYFRAME_DEPTH_SCALE_CLAMP_MIN = 0.1
 CAMERA_CONTROL_PI3X_KEYFRAME_DEPTH_SCALE_CLAMP_MAX = 10.0
-CAMERA_CONTROL_TARGET_INTRINSICS_POLICIES = frozenset({"fixed_first_frame", "prev_pi3x_source", "prev_pi3x_to_initial"})
 
 
 def default_pi3_repo() -> Path:
     return Path(__file__).resolve().parents[1] / "third_party" / "Pi3"
 
 
-def _env_path(name: str) -> Path | None:
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return None
-    return Path(value).expanduser()
+def default_pi3x_ckpt() -> Path:
+    return Path(__file__).resolve().parents[1] / "checkpoints" / "pi3x" / "model.safetensors"
 
 
 def center_crop_resize_first_frame(image: Any, height: int, width: int) -> Any:
@@ -99,9 +94,30 @@ def as_pose4x4(poses: torch.Tensor | np.ndarray) -> torch.Tensor:
     raise ValueError(f"Unsupported camera pose shape: {tuple(poses.shape)}")
 
 
+def se3_inverse(T: torch.Tensor | np.ndarray) -> torch.Tensor | np.ndarray:
+    """Compute the inverse of SE(3) camera extrinsics."""
+    if torch.is_tensor(T):
+        R = T[..., :3, :3]
+        t = T[..., :3, 3].unsqueeze(-1)
+        R_inv = R.transpose(-2, -1)
+        t_inv = -torch.matmul(R_inv, t)
+        bottom_row = torch.tensor([0, 0, 0, 1], device=T.device, dtype=T.dtype).repeat(*T.shape[:-2], 1, 1)
+        top_part = torch.cat([R_inv, t_inv], dim=-1)
+        return torch.cat([top_part, bottom_row], dim=-2)
+
+    R = T[..., :3, :3]
+    t = T[..., :3, 3, np.newaxis]
+    R_inv = np.swapaxes(R, -2, -1)
+    t_inv = -R_inv @ t
+    bottom_row = np.zeros((*T.shape[:-2], 1, 4), dtype=T.dtype)
+    bottom_row[..., :, 3] = 1
+    top_part = np.concatenate([R_inv, t_inv], axis=-1)
+    return np.concatenate([top_part, bottom_row], axis=-2)
+
+
 def prepare_camera_pose_rollout(camera_poses: torch.Tensor | np.ndarray, total_target_frames: int) -> torch.Tensor:
     poses = as_pose4x4(camera_poses)
-    inv0 = torch.linalg.inv(poses[0:1])
+    inv0 = se3_inverse(poses[0:1])
     poses = inv0 @ poses
     if poses.shape[0] < total_target_frames:
         pad = poses[-1:].repeat(total_target_frames - poses.shape[0], 1, 1)
@@ -139,27 +155,26 @@ def _import_pi3(pi3_repo: Path):
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
     from pi3.models.pi3x import Pi3X
-    from pi3.utils.geometry import depth_edge, recover_intrinsic_from_rays_d
+    from pi3.utils.geometry import recover_intrinsic_from_rays_d
 
-    return Pi3X, depth_edge, recover_intrinsic_from_rays_d
+    return Pi3X, recover_intrinsic_from_rays_d
 
 
-def _load_pi3x_model(Pi3X: Any, ckpt: Path | None, device: torch.device):
-    if ckpt is None:
-        try:
-            model = Pi3X.from_pretrained("yyfz233/Pi3X", local_files_only=True).eval()
-        except Exception:
-            model = Pi3X.from_pretrained("yyfz233/Pi3X").eval()
+def _load_pi3x_model(Pi3X: Any, device: torch.device):
+    ckpt = default_pi3x_ckpt().expanduser().resolve()
+    if not ckpt.is_file():
+        raise FileNotFoundError(
+            f"Missing Pi3X checkpoint: {ckpt}. Download the Pi3X checkpoint and place it at "
+            "checkpoints/pi3x/model.safetensors before running inference, dryrun, or training."
+        )
+    model = Pi3X(use_multimodal=False).eval()
+    if ckpt.suffix == ".safetensors":
+        from safetensors.torch import load_file
+
+        weight = load_file(str(ckpt))
     else:
-        ckpt = Path(ckpt).expanduser().resolve()
-        model = Pi3X(use_multimodal=False).eval()
-        if ckpt.suffix == ".safetensors":
-            from safetensors.torch import load_file
-
-            weight = load_file(str(ckpt))
-        else:
-            weight = torch.load(str(ckpt), map_location=device, weights_only=False)
-        model.load_state_dict(weight, strict=False)
+        weight = torch.load(str(ckpt), map_location=device, weights_only=False)
+    model.load_state_dict(weight, strict=False)
 
     model.disable_multimodal()
     return model.to(device)
@@ -195,7 +210,6 @@ def _normalize_intrinsics_shape(intrinsics: torch.Tensor, num_frames: int) -> to
 def _smooth_pi3x_keyframe_intrinsics(
     intrinsics: np.ndarray,
     *,
-    reference_intrinsic: np.ndarray | None,
     render_height: int,
     render_width: int,
 ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -203,13 +217,7 @@ def _smooth_pi3x_keyframe_intrinsics(
     if recovered.ndim != 3 or recovered.shape[-2:] != (3, 3):
         raise ValueError(f"Expected Pi3X keyframe intrinsics with shape [N, 3, 3], got {recovered.shape}.")
 
-    if reference_intrinsic is None:
-        reference = recovered[0].astype(np.float32, copy=True)
-    else:
-        reference = np.asarray(reference_intrinsic, dtype=np.float32).copy()
-        if reference.shape != (3, 3):
-            raise ValueError(f"reference_intrinsic must have shape [3, 3], got {reference.shape}.")
-
+    reference = recovered[0].astype(np.float32, copy=True)
     focal_min = float(CAMERA_CONTROL_PI3X_KEYFRAME_FOCAL_CLAMP_MIN)
     focal_max = float(CAMERA_CONTROL_PI3X_KEYFRAME_FOCAL_CLAMP_MAX)
     smooth_alpha = float(CAMERA_CONTROL_PI3X_KEYFRAME_FOCAL_SMOOTH_ALPHA)
@@ -227,10 +235,7 @@ def _smooth_pi3x_keyframe_intrinsics(
         raw_fy = max(abs(float(current[1, 1])), 1e-6)
         clamped_fx = float(np.clip(raw_fx / reference_fx, focal_min, focal_max) * reference_fx)
         clamped_fy = float(np.clip(raw_fy / reference_fy, focal_min, focal_max) * reference_fy)
-        if index == 0 and reference_intrinsic is not None:
-            final_fx = reference_fx
-            final_fy = reference_fy
-        elif index == 0:
+        if index == 0:
             final_fx = clamped_fx
             final_fy = clamped_fy
         else:
@@ -271,21 +276,6 @@ def _smooth_pi3x_keyframe_intrinsics(
         "smooth_alpha": smooth_alpha,
         "keyframes": records,
     }
-
-
-def _blend_intrinsics(source_intrinsic: np.ndarray, target_intrinsic: np.ndarray, alpha: float) -> np.ndarray:
-    source = np.asarray(source_intrinsic, dtype=np.float32)
-    target = np.asarray(target_intrinsic, dtype=np.float32)
-    if source.shape != (3, 3) or target.shape != (3, 3):
-        raise ValueError(f"Can only blend [3, 3] intrinsics, got {source.shape} and {target.shape}.")
-    alpha = float(np.clip(float(alpha), 0.0, 1.0))
-    blended = source.copy()
-    for row, col in ((0, 0), (1, 1), (0, 2), (1, 2)):
-        blended[row, col] = (1.0 - alpha) * float(source[row, col]) + alpha * float(target[row, col])
-    blended[0, 1] = 0.0
-    blended[1, 0] = 0.0
-    blended[2] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    return blended.astype(np.float32, copy=False)
 
 
 def _intrinsic_stats(intrinsic: np.ndarray) -> dict[str, float]:
@@ -839,7 +829,7 @@ def _max_pool_2d_np(x: np.ndarray, kernel_size: int, padding: int = 0) -> np.nda
     return np.nanmax(windows, axis=(-2, -1))
 
 
-def _moge_depth_edge(depth: np.ndarray, *, rtol: float, mask: np.ndarray, kernel_size: int = 3) -> np.ndarray:
+def _depth_edge_np(depth: np.ndarray, *, rtol: float, mask: np.ndarray, kernel_size: int = 3) -> np.ndarray:
     padding = kernel_size // 2
     max_valid = _max_pool_2d_np(np.where(mask, depth, -np.inf), kernel_size, padding=padding)
     min_valid = -_max_pool_2d_np(np.where(mask, -depth, -np.inf), kernel_size, padding=padding)
@@ -849,12 +839,14 @@ def _moge_depth_edge(depth: np.ndarray, *, rtol: float, mask: np.ndarray, kernel
     return edge & mask
 
 
-def _moge_points_to_normals(point: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _points_to_normals_np(point: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    point = np.asarray(point)
+    mask = np.asarray(mask, dtype=bool) & np.isfinite(point).all(axis=-1)
     height, width = point.shape[:2]
     mask_pad = np.zeros((height + 2, width + 2), dtype=bool)
     mask_pad[1:-1, 1:-1] = mask
     pts = np.zeros((height + 2, width + 2, 3), dtype=point.dtype)
-    pts[1:-1, 1:-1] = point
+    pts[1:-1, 1:-1] = np.where(mask[..., None], point, 0.0)
 
     up = pts[:-2, 1:-1] - pts[1:-1, 1:-1]
     left = pts[1:-1, :-2] - pts[1:-1, 1:-1]
@@ -883,14 +875,15 @@ def _moge_points_to_normals(point: np.ndarray, mask: np.ndarray) -> tuple[np.nda
         )
         & mask_pad[None, 1:-1, 1:-1]
     )
-    normal = (normals * valid[..., None]).sum(axis=0)
+    normal = np.where(valid[..., None], normals, 0.0).sum(axis=0)
     normal = normal / (np.linalg.norm(normal, axis=-1, keepdims=True) + 1.0e-12)
     normal_mask = valid.any(axis=0)
     normal = np.where(normal_mask[..., None], normal, 0.0)
+    normal = np.nan_to_num(normal, nan=0.0, posinf=0.0, neginf=0.0)
     return normal.astype(np.float32, copy=False), normal_mask
 
 
-def _moge_normals_edge(
+def _normal_edge_np(
     normals: np.ndarray,
     *,
     tol_deg: float,
@@ -898,6 +891,7 @@ def _moge_normals_edge(
     kernel_size: int = 3,
 ) -> np.ndarray:
     normals = normals / (np.linalg.norm(normals, axis=-1, keepdims=True) + 1.0e-12)
+    normals = np.nan_to_num(normals, nan=0.0, posinf=0.0, neginf=0.0)
     padding = kernel_size // 2
     normals_pad = np.pad(normals, ((padding, padding), (padding, padding), (0, 0)), mode="edge")
     mask_pad = np.pad(mask, ((padding, padding), (padding, padding)), mode="edge")
@@ -910,38 +904,61 @@ def _moge_normals_edge(
     return (angle > np.deg2rad(float(tol_deg))) & mask
 
 
+def _depth_normal_break_mask_np(
+    *,
+    point_map_world: np.ndarray,
+    depth_map: np.ndarray,
+    valid_mask: np.ndarray,
+    depth_rtol: float,
+    normal_tol_deg: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    normals, normal_mask = _points_to_normals_np(point_map_world, valid_mask)
+    depth_edge = _depth_edge_np(depth_map, rtol=float(depth_rtol), mask=valid_mask)
+    normal_edge = _normal_edge_np(normals, tol_deg=float(normal_tol_deg), mask=normal_mask)
+    break_mask = depth_edge & normal_edge
+    valid_count = int(valid_mask.sum())
+    return break_mask, {
+        "depth_rtol": float(depth_rtol),
+        "normal_tol_deg": float(normal_tol_deg),
+        "valid_pixels": valid_count,
+        "depth_edge_pixels": int(depth_edge.sum()),
+        "normal_edge_pixels": int(normal_edge.sum()),
+        "break_pixels": int(break_mask.sum()),
+        "break_fraction_of_valid": float(break_mask.sum() / max(valid_count, 1)),
+    }
+
+
 def _apply_mesh_break(
     *,
     point_map_world: np.ndarray,
     depth_map: np.ndarray,
     valid_mask: np.ndarray,
     mode: str,
-    moge_depth_rtol: float,
-    moge_normal_tol_deg: float,
+    depth_rtol: float,
+    normal_tol_deg: float,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     mode = str(mode or "none")
     valid_mask = np.asarray(valid_mask, dtype=bool)
     if mode == "none":
         return valid_mask, {"mode": "none", "valid_pixels": int(valid_mask.sum())}
-    if mode != "moge_depth_normal":
+    if mode != "depth_normal":
         raise ValueError(f"Unsupported camera-control mesh break mode: {mode!r}.")
 
-    normals, normal_mask = _moge_points_to_normals(point_map_world, valid_mask)
-    depth_edge = _moge_depth_edge(depth_map, rtol=float(moge_depth_rtol), mask=valid_mask)
-    normal_edge = _moge_normals_edge(normals, tol_deg=float(moge_normal_tol_deg), mask=normal_mask)
-    break_mask = depth_edge & normal_edge
+    break_mask, edge_stats = _depth_normal_break_mask_np(
+        point_map_world=point_map_world,
+        depth_map=depth_map,
+        valid_mask=valid_mask,
+        depth_rtol=float(depth_rtol),
+        normal_tol_deg=float(normal_tol_deg),
+    )
     mesh_valid = valid_mask & ~break_mask
-    valid_count = int(valid_mask.sum())
     return mesh_valid, {
+        **edge_stats,
         "mode": mode,
-        "moge_depth_rtol": float(moge_depth_rtol),
-        "moge_normal_tol_deg": float(moge_normal_tol_deg),
-        "valid_pixels": valid_count,
-        "depth_edge_pixels": int(depth_edge.sum()),
-        "normal_edge_pixels": int(normal_edge.sum()),
-        "break_pixels": int(break_mask.sum()),
+        "mesh_depth_rtol": float(depth_rtol),
+        "mesh_normal_tol_deg": float(normal_tol_deg),
         "mesh_valid_pixels": int(mesh_valid.sum()),
-        "break_fraction_of_valid": float(break_mask.sum() / max(valid_count, 1)),
     }
 
 
@@ -957,7 +974,7 @@ def _splat_mesh_samples_to_view_fast(
     return_source_xy: bool = False,
     z_eps: float = 1.0e-4,
 ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
-    w2c = np.linalg.inv(target_c2w.astype(np.float32, copy=False))
+    w2c = se3_inverse(target_c2w.astype(np.float32, copy=False))
     points_cam = points_world @ w2c[:3, :3].T + w2c[:3, 3]
     z = points_cam[:, 2].astype(np.float32, copy=False)
     valid = np.isfinite(points_cam).all(axis=1) & (z > float(z_eps))
@@ -1024,7 +1041,7 @@ def _splat_mesh_samples_to_view_torch(
     return_source_xy: bool = False,
     z_eps: float = 1.0e-4,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    w2c = torch.linalg.inv(target_c2w.to(dtype=torch.float32))
+    w2c = se3_inverse(target_c2w.to(dtype=torch.float32))
     points_cam = points_world @ w2c[:3, :3].T + w2c[:3, 3]
     z = points_cam[:, 2]
     valid = torch.isfinite(points_cam).all(dim=1) & (z > float(z_eps))
@@ -1185,8 +1202,6 @@ def _visibility_frames_to_tensor(
 
 @dataclass(frozen=True)
 class Pi3XWarpRendererConfig:
-    pi3_repo: Path | None = None
-    pi3x_ckpt: Path | None = None
     pi3_pixel_limit: int = CAMERA_CONTROL_PI3_PIXEL_LIMIT
     conf_threshold: float = CAMERA_CONTROL_CONF_THRESHOLD
     depth_edge_rtol: float = CAMERA_CONTROL_DEPTH_EDGE_RTOL
@@ -1195,8 +1210,8 @@ class Pi3XWarpRendererConfig:
     target_fill_radius: int = CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_RADIUS
     target_fill_min_neighbors: int = CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_MIN_NEIGHBORS
     mesh_break_mode: str = CAMERA_CONTROL_DEFAULT_MESH_BREAK_MODE
-    moge_depth_rtol: float = CAMERA_CONTROL_DEFAULT_MOGE_DEPTH_RTOL
-    moge_normal_tol_deg: float = CAMERA_CONTROL_DEFAULT_MOGE_NORMAL_TOL_DEG
+    mesh_depth_rtol: float = CAMERA_CONTROL_DEFAULT_MESH_DEPTH_RTOL
+    mesh_normal_tol_deg: float = CAMERA_CONTROL_DEFAULT_MESH_NORMAL_TOL_DEG
 
 
 class Pi3XWarpRenderer:
@@ -1209,22 +1224,18 @@ class Pi3XWarpRenderer:
         self._pi3x_runtime: dict[str, Any] | None = None
 
     def _runtime_key(self) -> tuple[str, str | None]:
-        repo = Path(self.config.pi3_repo or default_pi3_repo()).expanduser().resolve()
-        ckpt = self.config.pi3x_ckpt
-        if ckpt is None:
-            ckpt = _env_path("PI3X_CKPT")
-        ckpt_key = None if ckpt is None else str(Path(ckpt).expanduser().resolve())
+        repo = default_pi3_repo().expanduser().resolve()
+        ckpt_key = str(default_pi3x_ckpt().expanduser().resolve())
         return str(repo), ckpt_key
 
     def _get_pi3x_runtime(self, device: torch.device) -> dict[str, Any]:
         repo_key, ckpt_key = self._runtime_key()
         runtime = self._pi3x_runtime
         if runtime is None or runtime.get("repo_key") != repo_key or runtime.get("ckpt_key") != ckpt_key:
-            Pi3X, depth_edge, recover_intrinsic_from_rays_d = _import_pi3(Path(repo_key))
-            model = _load_pi3x_model(Pi3X, None if ckpt_key is None else Path(ckpt_key), device)
+            Pi3X, recover_intrinsic_from_rays_d = _import_pi3(Path(repo_key))
+            model = _load_pi3x_model(Pi3X, device)
             runtime = {
                 "ckpt_key": ckpt_key,
-                "depth_edge": depth_edge,
                 "model": model,
                 "recover_intrinsic_from_rays_d": recover_intrinsic_from_rays_d,
                 "repo_key": repo_key,
@@ -1243,7 +1254,6 @@ class Pi3XWarpRenderer:
         device = torch.device(device or image_tensor.device)
         runtime = self._get_pi3x_runtime(device)
         model = runtime["model"]
-        depth_edge = runtime["depth_edge"]
         recover_intrinsic_from_rays_d = runtime["recover_intrinsic_from_rays_d"]
 
         src_height = int(image_tensor.shape[-2])
@@ -1266,7 +1276,7 @@ class Pi3XWarpRenderer:
                 intrinsics=None,
                 rays=None,
                 poses=None,
-                with_prior=True,
+                with_prior=False,
             )
 
         rays_d = F.normalize(res["local_points"][0].detach(), dim=-1)
@@ -1275,14 +1285,25 @@ class Pi3XWarpRenderer:
         conf = torch.sigmoid(res["conf"][..., 0])
         local_finite = torch.isfinite(res["local_points"]).all(dim=-1) & (res["local_points"][..., 2] > 0.0)
         valid = (conf > float(self.config.conf_threshold)) & local_finite
-        non_edge = ~depth_edge(res["local_points"][..., 2], rtol=float(self.config.depth_edge_rtol))
-        valid = valid & non_edge
+        conf_map = conf[0, 0].detach().float().cpu().numpy()
+        depth_map = res["local_points"][0, 0, ..., 2].detach().float().cpu().numpy()
+        point_map_world = res["points"][0, 0].detach().float().cpu().numpy()
+        valid_mask = valid[0, 0].detach().cpu().numpy()
+        break_mask, edge_filter_stats = _depth_normal_break_mask_np(
+            point_map_world=point_map_world,
+            depth_map=depth_map,
+            valid_mask=valid_mask,
+            depth_rtol=float(self.config.depth_edge_rtol),
+            normal_tol_deg=float(self.config.mesh_normal_tol_deg),
+        )
+        valid_mask = valid_mask & ~break_mask
 
         geometry = {
-            "conf_map": conf[0, 0].detach().float().cpu().numpy(),
-            "depth_map": res["local_points"][0, 0, ..., 2].detach().float().cpu().numpy(),
+            "conf_map": conf_map,
+            "depth_map": depth_map,
+            "depth_normal_edge_filter_stats": edge_filter_stats,
             "intrinsic": intrinsics.astype(np.float32, copy=False),
-            "point_map_world": res["points"][0, 0].detach().float().cpu().numpy(),
+            "point_map_world": point_map_world,
             "render_height": render_height,
             "render_width": render_width,
             "source_pose": res["camera_poses"][0, 0].detach().float().cpu().numpy(),
@@ -1291,7 +1312,7 @@ class Pi3XWarpRenderer:
                 0,
                 255,
             ).astype(np.uint8),
-            "valid_mask": valid[0, 0].detach().cpu().numpy(),
+            "valid_mask": valid_mask,
         }
         return self.ensure_valid_depth_geometry(geometry, reason="pi3x_runtime")
 
@@ -1299,7 +1320,6 @@ class Pi3XWarpRenderer:
         self,
         image_tensors: list[torch.Tensor],
         device: torch.device | None = None,
-        condition_intrinsic: np.ndarray | torch.Tensor | None = None,
         scale_reference_geometry: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         keyframe_tensors: list[torch.Tensor] = []
@@ -1321,7 +1341,6 @@ class Pi3XWarpRenderer:
         keyframe_tensors = [tensor.to(device=device, dtype=torch.float32) for tensor in keyframe_tensors]
         runtime = self._get_pi3x_runtime(device)
         model = runtime["model"]
-        depth_edge = runtime["depth_edge"]
         recover_intrinsic_from_rays_d = runtime["recover_intrinsic_from_rays_d"]
 
         src_height = int(keyframe_tensors[-1].shape[-2])
@@ -1341,19 +1360,6 @@ class Pi3XWarpRenderer:
         pi3_imgs = torch.stack(pi3_frame_batch, dim=0).unsqueeze(0)
         num_keyframes = int(pi3_imgs.shape[1])
 
-        condition_intrinsics_np = None
-        if condition_intrinsic is not None:
-            if isinstance(condition_intrinsic, torch.Tensor):
-                condition_intrinsics_np = condition_intrinsic.detach().float().cpu().numpy()
-            else:
-                condition_intrinsics_np = np.asarray(condition_intrinsic, dtype=np.float32)
-            if condition_intrinsics_np.shape != (3, 3):
-                raise ValueError(
-                    "Pi3X keyframe intrinsic condition must have shape [3, 3], "
-                    f"got {condition_intrinsics_np.shape}."
-                )
-            condition_intrinsics_np = condition_intrinsics_np.astype(np.float32, copy=False)
-
         _force_pi3x_float_heads(model)
         with torch.no_grad(), _autocast_context(device):
             res = model(
@@ -1370,7 +1376,6 @@ class Pi3XWarpRenderer:
         recovered_intrinsics_np = _normalize_intrinsics_shape(intrinsics, num_keyframes).numpy()
         intrinsics_np, intrinsic_smoothing_stats = _smooth_pi3x_keyframe_intrinsics(
             recovered_intrinsics_np,
-            reference_intrinsic=condition_intrinsics_np,
             render_height=render_height,
             render_width=render_width,
         )
@@ -1383,13 +1388,24 @@ class Pi3XWarpRenderer:
         conf = torch.sigmoid(res["conf"][..., 0])
         local_finite = torch.isfinite(res["local_points"]).all(dim=-1) & (res["local_points"][..., 2] > 0.0)
         valid = (conf > float(self.config.conf_threshold)) & local_finite
-        non_edge = ~depth_edge(res["local_points"][..., 2], rtol=float(self.config.depth_edge_rtol))
-        valid = valid & non_edge
 
         conf_maps = conf[0].detach().float().cpu().numpy()
         depth_maps = res["local_points"][0, ..., 2].detach().float().cpu().numpy()
         point_maps_world = res["points"][0].detach().float().cpu().numpy()
         source_poses = res["camera_poses"][0].detach().float().cpu().numpy()
+        valid_masks = valid[0].detach().cpu().numpy()
+        edge_filter_stats = []
+        for keyframe_index in range(num_keyframes):
+            break_mask, stats = _depth_normal_break_mask_np(
+                point_map_world=point_maps_world[keyframe_index],
+                depth_map=depth_maps[keyframe_index],
+                valid_mask=valid_masks[keyframe_index],
+                depth_rtol=float(self.config.depth_edge_rtol),
+                normal_tol_deg=float(self.config.mesh_normal_tol_deg),
+            )
+            valid_masks[keyframe_index] = valid_masks[keyframe_index] & ~break_mask
+            stats["keyframe_index"] = int(keyframe_index)
+            edge_filter_stats.append(stats)
         scale_alignment_stats: dict[str, Any] = {
             "applied_scale": 1.0,
             "policy": "none",
@@ -1403,7 +1419,7 @@ class Pi3XWarpRenderer:
                 if reference_valid is None
                 else np.asarray(reference_valid, dtype=bool),
                 current_depth=depth_maps[0],
-                current_valid_mask=valid[0, 0].detach().cpu().numpy(),
+                current_valid_mask=valid_masks[0],
             )
             depth_maps = depth_maps * float(scale)
             point_maps_world = point_maps_world * float(scale)
@@ -1415,13 +1431,13 @@ class Pi3XWarpRenderer:
             0,
             255,
         ).astype(np.uint8)
-        valid_masks = valid[0].detach().cpu().numpy()
 
         keyframe_geometries = []
         for keyframe_index in range(num_keyframes):
             keyframe_geometry = {
                 "conf_map": conf_maps[keyframe_index],
                 "depth_map": depth_maps[keyframe_index],
+                "depth_normal_edge_filter_stats": edge_filter_stats[keyframe_index],
                 "geometry_backend": "pi3x_keyframe",
                 "intrinsic": intrinsics_np[keyframe_index].astype(np.float32, copy=False),
                 "intrinsic_recovered": recovered_intrinsics_np[keyframe_index].astype(np.float32, copy=False),
@@ -1446,7 +1462,6 @@ class Pi3XWarpRenderer:
             "intrinsic": latest_geometry["intrinsic"],
             "intrinsic_smoothing_stats": intrinsic_smoothing_stats,
             "intrinsics_source": "pi3x_recovered_focal_clamped_smoothed",
-            "intrinsics_conditioned": False,
             "keyframe_count": num_keyframes,
             "keyframe_geometries": keyframe_geometries,
             "pose_source": "pi3x_estimated",
@@ -1573,8 +1588,8 @@ class Pi3XWarpRenderer:
                 depth_map=mesh_depth_map,
                 valid_mask=augmented_valid_mask,
                 mode=current_mesh_break_mode,
-                moge_depth_rtol=float(self.config.moge_depth_rtol),
-                moge_normal_tol_deg=float(self.config.moge_normal_tol_deg),
+                depth_rtol=float(self.config.mesh_depth_rtol),
+                normal_tol_deg=float(self.config.mesh_normal_tol_deg),
             )
             mesh_break_stats["fill_pixels"] = int(np.asarray(fill_mask, dtype=bool).sum())
             mesh_break_stats["fill_stats"] = fill_stats
@@ -1625,9 +1640,6 @@ class Pi3XWarpRenderer:
         width: int,
         device: torch.device | None = None,
         target_intrinsics: torch.Tensor | np.ndarray | None = None,
-        initial_intrinsic: torch.Tensor | np.ndarray | None = None,
-        target_intrinsics_policy: str = "prev_pi3x_to_initial",
-        target_intrinsics_blend_to_initial: float = 1.0,
         chunk_index: int | None = None,
         invisible_fill_mode: str = CAMERA_CONTROL_DEFAULT_WARP_INVISIBLE_FILL,
         render_mode: str | None = None,
@@ -1657,9 +1669,7 @@ class Pi3XWarpRenderer:
             )
         if target_intrinsics is not None:
             if "keyframe_geometries" in geometry:
-                if not bool(geometry.get("preserve_pi3x_keyframe_points", False)) and not bool(
-                    geometry.get("intrinsics_conditioned", False)
-                ):
+                if not bool(geometry.get("preserve_pi3x_keyframe_points", False)):
                     updated_keyframes = [
                         _geometry_with_intrinsic(keyframe_geometry, render_intrinsics_np[0])
                         for keyframe_geometry in geometry["keyframe_geometries"]
@@ -1675,54 +1685,18 @@ class Pi3XWarpRenderer:
                 geometry = _geometry_with_intrinsic(geometry, render_intrinsics_np[0])
 
         keyframe_geometries = geometry.get("keyframe_geometries")
-        target_intrinsics_policy = str(target_intrinsics_policy)
-        if keyframe_geometries is not None and target_intrinsics_policy != "fixed_first_frame":
+        if keyframe_geometries is not None:
             latest_keyframe_intrinsic = np.asarray(keyframe_geometries[-1]["intrinsic"], dtype=np.float32)
-            if initial_intrinsic is None:
-                initial_intrinsic_np = render_intrinsics_np[0]
-            elif isinstance(initial_intrinsic, torch.Tensor):
-                initial_intrinsic_np = initial_intrinsic.detach().float().cpu().numpy()
-            else:
-                initial_intrinsic_np = np.asarray(initial_intrinsic, dtype=np.float32)
-            if initial_intrinsic_np.shape != (3, 3):
-                raise ValueError(f"initial_intrinsic must have shape [3, 3], got {initial_intrinsic_np.shape}.")
-
-            if target_intrinsics_policy == "prev_pi3x_source":
-                render_intrinsics_np = np.repeat(
-                    latest_keyframe_intrinsic[None],
-                    relative_target_poses.shape[0],
-                    axis=0,
-                ).astype(np.float32, copy=False)
-            elif target_intrinsics_policy == "prev_pi3x_to_initial":
-                alpha_end = float(np.clip(float(target_intrinsics_blend_to_initial), 0.0, 1.0))
-                if chunk_index is not None and int(chunk_index) > 0:
-                    target_alphas = np.linspace(
-                        0.0,
-                        alpha_end,
-                        num=max(int(relative_target_poses.shape[0]) - 1, 1),
-                        dtype=np.float32,
-                    )
-                    alphas = np.concatenate([np.zeros((1,), dtype=np.float32), target_alphas], axis=0)
-                else:
-                    alphas = np.linspace(0.0, alpha_end, num=relative_target_poses.shape[0], dtype=np.float32)
-                render_intrinsics_np = np.stack(
-                    [
-                        _blend_intrinsics(latest_keyframe_intrinsic, initial_intrinsic_np, float(alpha))
-                        for alpha in alphas
-                    ],
-                    axis=0,
-                ).astype(np.float32, copy=False)
-            else:
-                raise ValueError(
-                    "target_intrinsics_policy must be one of "
-                    f"{sorted(CAMERA_CONTROL_TARGET_INTRINSICS_POLICIES)}, got {target_intrinsics_policy!r}."
-                )
+            render_intrinsics_np = np.repeat(
+                latest_keyframe_intrinsic[None],
+                relative_target_poses.shape[0],
+                axis=0,
+            ).astype(np.float32, copy=False)
             geometry = dict(geometry)
             geometry["target_intrinsics_stats"] = {
                 "chunk_index": None if chunk_index is None else int(chunk_index),
                 "end": _intrinsic_stats(render_intrinsics_np[-1]),
-                "initial": _intrinsic_stats(initial_intrinsic_np),
-                "policy": target_intrinsics_policy,
+                "policy": "prev_pi3x_source",
                 "source": _intrinsic_stats(latest_keyframe_intrinsic),
                 "start": _intrinsic_stats(render_intrinsics_np[0]),
             }
@@ -1989,9 +1963,6 @@ class Pi3XWarpRenderer:
         device: torch.device | None = None,
         geometry: dict[str, Any] | None = None,
         target_intrinsics: torch.Tensor | np.ndarray | None = None,
-        initial_intrinsic: torch.Tensor | np.ndarray | None = None,
-        target_intrinsics_policy: str = "prev_pi3x_to_initial",
-        target_intrinsics_blend_to_initial: float = 1.0,
         chunk_index: int | None = None,
         translation_scale: float = CAMERA_CONTROL_DEFAULT_TRANSLATION_SCALE,
         translation_scale_use_first_frame_depth: bool = CAMERA_CONTROL_DEFAULT_TRANSLATION_SCALE_USE_FIRST_FRAME_DEPTH,
@@ -2018,9 +1989,6 @@ class Pi3XWarpRenderer:
             width=int(width),
             device=device,
             target_intrinsics=target_intrinsics,
-            initial_intrinsic=initial_intrinsic,
-            target_intrinsics_policy=str(target_intrinsics_policy),
-            target_intrinsics_blend_to_initial=float(target_intrinsics_blend_to_initial),
             chunk_index=chunk_index,
             invisible_fill_mode=invisible_fill_mode,
             render_mode=render_mode,

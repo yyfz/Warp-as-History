@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright 2025 The Helios Team and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,7 +32,14 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
-from diffusers.utils import apply_lora_scale, logging
+from diffusers.utils import logging
+try:
+    from diffusers.utils import apply_lora_scale
+except ImportError:
+    def apply_lora_scale(_scale_key):
+        def decorator(fn):
+            return fn
+        return decorator
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 
 
