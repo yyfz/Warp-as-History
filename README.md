@@ -19,9 +19,10 @@
 </p>
 </div>
 
-Warp-as-History is a Helios-based video generation pipeline with Pi3X camera
-warp conditioning. It supports inference with online Pi3X warps and LoRA
-training from raw videos.
+<div align="center">
+This repository provides the official implementation of Warp-as-History. Our method enables near real-time camera trajectory following and viewpoint manipulation, similar to HappyOyster and Genie 3, using only a single camera-annotated training example.
+</div>
+
 
 ## Installation
 
