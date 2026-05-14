@@ -218,7 +218,7 @@ per call via `warp_video` and optionally `warp_visibility_mask`.
 An interactive browser UI is available for prompt-and-button camera control:
 
 ```bash
-mysrun -c 8 -g 1 python scripts/web_control.py \
+python scripts/web_control.py \
   --host 0.0.0.0 \
   --port 7860
 ```
