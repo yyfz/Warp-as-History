@@ -1,7 +1,7 @@
 <div align="center">
 <h1>
-  Warp-as-History:<br>
-  Generalizable Camera-Controlled Video Generation<br>
+  Warp-as-History:
+  Generalizable Camera-Controlled Video Generation 
   from <strong>One</strong> Training Video
 </h1>
 <p class="eyebrow">Video History is More Than Context.</p>
