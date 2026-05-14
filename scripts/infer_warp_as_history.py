@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 DEFAULT_MODEL = "checkpoints/helios-distilled"
+DEFAULT_WAH_LORA = "checkpoints/warp-as-history/visible_lora_state_step1000.safetensors"
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path, default=None, help="Output mp4 path. Defaults to runs/<csv_stem>.mp4.")
     parser.add_argument("--model_path", default=DEFAULT_MODEL)
-    parser.add_argument("--lora_path", default="")
+    parser.add_argument("--lora_path", default=DEFAULT_WAH_LORA)
     parser.add_argument("--camera_key", default="camera_poses")
     parser.add_argument("--height", type=int, default=384)
     parser.add_argument("--width", type=int, default=640)
@@ -225,6 +226,24 @@ def resolve_model_path(model_path: str) -> str:
     return str(path)
 
 
+def resolve_lora_path(lora_path: str | Path | None) -> str | None:
+    if lora_path is None:
+        return None
+    value = str(lora_path).strip()
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    path = Path(str(path.absolute()))
+    checkpoints_root = Path(str((REPO_ROOT / "checkpoints").absolute()))
+    if not path.is_relative_to(checkpoints_root):
+        raise ValueError(f"--lora_path must be under {checkpoints_root}, got {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing LoRA checkpoint: {path}. Run `python scripts/check_models.py`.")
+    return str(path)
+
+
 def disable_diffusers_optional_attention() -> None:
     try:
         import diffusers.utils.import_utils as diffusers_import_utils
@@ -304,11 +323,12 @@ def main() -> None:
     generator = torch.Generator(device=device).manual_seed(int(args.seed)) if device.startswith("cuda") else None
 
     model_path = resolve_model_path(args.model_path)
+    lora_path = None if args.no_lora else resolve_lora_path(args.lora_path)
     pipe = WarpAsHistoryPipeline.from_pretrained(model_path, torch_dtype=dtype).to(device)
     pipe_kwargs = {
         "prompt": prompt,
         "image": Image.open(image_path).convert("RGB"),
-        "lora_path": None if args.no_lora else (args.lora_path or None),
+        "lora_path": lora_path,
         "height": int(args.height),
         "width": int(args.width),
         "num_frames": num_frames,
@@ -334,6 +354,7 @@ def main() -> None:
                 "conditioning_type": conditioning_type,
                 "image": str(image_path),
                 "output": str(output),
+                "lora_path": lora_path,
                 "frames": len(frames),
                 "conditioning_frames": conditioning_frames,
                 "num_frames": num_frames,

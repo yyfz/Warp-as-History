@@ -29,8 +29,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.infer_warp_as_history import (  # noqa: E402
     DEFAULT_MODEL,
+    DEFAULT_WAH_LORA,
     disable_diffusers_optional_attention,
     frame_to_uint8,
+    resolve_lora_path,
     resolve_model_path,
     torch_dtype_from_arg,
     unwrap_video_frames,
@@ -42,7 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--model_path", default=DEFAULT_MODEL)
-    parser.add_argument("--lora_path", default="")
+    parser.add_argument("--lora_path", default=DEFAULT_WAH_LORA)
+    parser.add_argument("--no_lora", action="store_true", help="Run without loading the default Warp-as-History LoRA.")
     parser.add_argument("--height", type=int, default=384)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--fps", type=int, default=16)
@@ -1009,7 +1012,7 @@ def main() -> None:
         disable_diffusers_optional_attention()
     config = AppConfig(
         model_path=resolve_model_path(args.model_path),
-        lora_path=args.lora_path or None,
+        lora_path=None if args.no_lora else resolve_lora_path(args.lora_path),
         height=int(args.height),
         width=int(args.width),
         fps=int(args.fps),

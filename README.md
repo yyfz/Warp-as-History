@@ -67,6 +67,7 @@ your environment.
 
 - Helios-Distilled (default): [`BestWishYsh/Helios-Distilled`](https://huggingface.co/BestWishYsh/Helios-Distilled/tree/main)
 - Pi3X: [`yyfz233/Pi3X`](https://huggingface.co/yyfz233/Pi3X)
+- Warp-as-History LoRA (default): [`yyfz233/warp-as-history`](https://huggingface.co/yyfz233/warp-as-history)
 - Helios-Mid (optional, training only): [`BestWishYsh/Helios-Mid`](https://huggingface.co/BestWishYsh/Helios-Mid)
 
 Download the required models once before inference or training:
@@ -77,6 +78,9 @@ huggingface-cli download BestWishYsh/Helios-Distilled \
 
 huggingface-cli download yyfz233/Pi3X model.safetensors \
   --local-dir checkpoints/pi3x
+
+huggingface-cli download yyfz233/warp-as-history visible_lora_state_step1000.safetensors \
+  --local-dir checkpoints/warp-as-history
 
 # only for training
 huggingface-cli download BestWishYsh/Helios-Mid \
@@ -99,9 +103,12 @@ end-to-end inference with:
 
 ```bash
 python scripts/infer_warp_as_history.py data/demo/angel.csv \
-  --lora_path /path/to/visible_lora_state.pt \
   --output runs/angel.mp4
 ```
+
+By default, inference loads
+`checkpoints/warp-as-history/visible_lora_state_step1000.safetensors`. Pass
+`--no_lora` only for ablations.
 
 Pass `--warp_debug_dir runs/angel_warp_debug` to also save the warp
 conditioning video as `runs/angel_warp_debug/warp.mp4`.
@@ -133,7 +140,7 @@ video = pipe(
     image=first_frame,
     camera_poses=camera_poses,
     camera_control_translation_scale=0.1,
-    lora_path="/path/to/visible_lora_state.pt",
+    lora_path="checkpoints/warp-as-history/visible_lora_state_step1000.safetensors",
 )
 ```
 
@@ -213,8 +220,7 @@ An interactive browser UI is available for prompt-and-button camera control:
 ```bash
 mysrun -c 8 -g 1 python scripts/web_control.py \
   --host 0.0.0.0 \
-  --port 7860 \
-  --model_path checkpoints/helios-distilled
+  --port 7860
 ```
 
 Open the printed URL, upload a first frame, enter a prompt, select translation
@@ -249,6 +255,27 @@ python scripts/train_warp_as_history_lora.py \
 The training script writes `train_config.json`, `train_loss.json`,
 `visible_lora_state.pt`, and step checkpoints when `--save_every` is enabled.
 
+## Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@article{wang2026warpasHistory,
+  title={Warp-as-History: Generalizable Camera-Controlled Video Generation from One Training Video},
+  author={Wang, Yifan and He, Tong},
+  journal={arXiv preprint arXiv:},
+  year={2026}
+}
+```
+
+## Acknowledgements
+
+We sincerely thank the authors of
+[Helios](https://github.com/PKU-YuanGroup/Helios) for releasing such an
+excellent open-source video generation model. Warp-as-History is built directly
+on top of Helios, and this work would not be possible without their model,
+codebase, and open research contribution.
+
 ## License
 
 - Helios code and weights follow the upstream Helios license:
@@ -259,3 +286,8 @@ The training script writes `train_config.json`, `train_loss.json`,
   Apache-2.0; see [LICENSE](LICENSE).
 - LoRA weights are released under CC BY-NC 4.0 and are strictly
   non-commercial.
+- Some training/inference examples are derived from one publicly available video
+  sequence from the DAVIS Challenge dataset. The original DAVIS data is not
+  covered by this repository license and should be obtained from the official
+  DAVIS website: https://davischallenge.org/. Please follow the DAVIS dataset
+  terms and cite the corresponding DAVIS papers when using DAVIS-derived data.
