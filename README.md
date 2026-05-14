@@ -1,8 +1,8 @@
 <div align="center">
 <h1>
-  <span class="title-lead title-mark">Warp-as-History:</span>
-  <span class="title-rest">Generalizable Camera-Controlled Video Generation</span>
-  <span class="title-tail">from <span class="title-highlight">One</span> Training Video</span>
+  Warp-as-History:<br>
+  Generalizable Camera-Controlled Video Generation<br>
+  from <strong>One</strong> Training Video
 </h1>
 <p class="eyebrow">Video History is More Than Context.</p>
 <p class="authors"><a href="https://yyfz.github.io/">Yifan Wang</a><sup>1,2</sup> and <a href="https://tonghe90.github.io/">Tong He</a><sup>2,3</sup></p>
@@ -13,8 +13,8 @@
 </p>
 <img src="assets/github_teaser.jpg" alt="Warp-as-History teaser" width="100%">
 <p>
-  <a href="https://yyfz.github.io/warp-as-history" style="display:inline-block; padding:10px 18px; border-radius:999px; background:#111111; color:#ffffff; font-weight:600; text-decoration:none;">
-    See More Demo&nbsp;&#8599;
+  <a href="https://yyfz.github.io/warp-as-history">
+    <img src="assets/demo_button.svg" alt="See More Demo" height="44">
   </a>
 </p>
 </div>
@@ -161,7 +161,7 @@ The training script writes `train_config.json`, `train_loss.json`,
 ## License
 
 - Helios code and weights follow the upstream Helios license:
-  https://github.com/PKU-YuanGroup/Helios?tab=readme-ov-file
+  https://github.com/PKU-YuanGroup/Helios
 - Pi3X code and weights follow the upstream Pi3 license:
   https://github.com/yyfz/Pi3
 - Warp-as-History code authored in this repository is licensed under

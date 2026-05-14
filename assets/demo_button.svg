@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="206" height="44" viewBox="0 0 206 44" role="img" aria-label="See More Demo">
+  <defs>
+    <linearGradient id="button-fill" x1="0" y1="0" x2="206" y2="44" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#20232a"/>
+      <stop offset="1" stop-color="#0b0d12"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="204" height="42" rx="21" fill="url(#button-fill)"/>
+  <rect x="1.5" y="1.5" width="203" height="41" rx="20.5" fill="none" stroke="#ffffff" stroke-opacity="0.14"/>
+  <text x="25" y="28" fill="#ffffff" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="15" font-weight="650" letter-spacing="0">See More Demo</text>
+  <circle cx="173" cy="22" r="12" fill="#ffffff" fill-opacity="0.12"/>
+  <path d="M168 27L178 17M171 17H178V24" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
