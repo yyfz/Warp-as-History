@@ -20,7 +20,7 @@
 </div>
 
 <div align="center">
-This repository provides the official implementation of Warp-as-History. Our method enables real-time camera trajectory following and viewpoint manipulation, similar to HappyOyster and Genie 3, using only a single camera-annotated training example.
+This repository provides the official implementation of Warp-as-History. Our method enables near real-time camera trajectory following and viewpoint manipulation, similar to HappyOyster and Genie 3, using only a single camera-annotated training example.
 </div>
 
 
