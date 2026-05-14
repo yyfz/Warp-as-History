@@ -102,6 +102,9 @@ python scripts/infer_warp_as_history.py data/demo/angel.csv \
   --output runs/angel.mp4
 ```
 
+Pass `--warp_debug_dir runs/angel_warp_debug` to also save the warp
+conditioning video as `runs/angel_warp_debug/warp.mp4`.
+
 Each demo CSV has these columns:
 
 ```csv
@@ -136,11 +139,88 @@ video = pipe(
 `camera_control_translation_scale` controls the online warp translation scale
 and defaults to `0.1`.
 
-By default, Helios is loaded from `checkpoints/helios-distilled` and Pi3X is
-loaded from `checkpoints/pi3x/model.safetensors`.
-Any explicit Helios override, such as `--model_path`, `--base_model_path`, or
-`--transformer_path`, must still point under this repository's `checkpoints/`
-directory.
+If neither `camera_poses` nor `warp_video` is provided,
+`WarpAsHistoryPipeline` falls back to the original Helios pipeline. This path
+does not load or apply Warp-as-History LoRA weights, prompt triggers, warp
+latents, or visible-token masking:
+
+```python
+video = pipe(
+    prompt="a car driving through a roundabout",
+    image=first_frame,
+    num_frames=33,
+)
+```
+
+Passing `lora_path` without `camera_poses` or `warp_video` raises an error,
+because WAH LoRA weights are only defined for Warp-as-History conditioning.
+Original Helios keyword arguments, such as `guidance_scale` and
+`num_inference_steps`, are passed through on this fallback path.
+
+To save the warp conditioning used by a Warp-as-History run, pass
+`warp_debug_dir`. The pipeline writes only `warp.mp4` under that directory:
+
+```python
+video = pipe(
+    prompt=prompt,
+    image=first_frame,
+    camera_poses=camera_poses,
+    warp_debug_dir="runs/angel_warp_debug",
+)
+```
+
+Use `return_warp_debug=True` when you also want the returned object to include
+the CPU `warp_video` tensor. Warp debug is only available when `camera_poses` or
+`warp_video` is provided.
+
+For online/autoregressive generation, initialize a state once and feed one
+camera or warp chunk at a time:
+
+```python
+state = pipe.init_autoregressive_state(
+    prompt=prompt,
+    image=first_frame,
+    conditioning_type="camera",
+    num_frames=99,
+    height=384,
+    width=640,
+    generator=generator,
+)
+
+window = state["window_num_frames"]  # 33 with the default WAH recipe
+for chunk_index in range(state["num_warp_chunks"]):
+    start = chunk_index * window
+    camera_chunk = camera_poses[start : start + window]
+    chunk_video, state = pipe.generate_next_chunk(
+        state,
+        camera_poses=camera_chunk,
+    )
+
+video = pipe.finalize_autoregressive_state(state)
+```
+
+`generate_next_chunk` returns the newly finalized video frames plus the next
+state. For camera control, the first chunk should provide `window` poses. Later
+chunks may either provide `window` new poses, in which case the pipeline
+prepends the cached previous boundary pose, or provide `window + 1` poses
+including that boundary pose explicitly. For pre-rendered warp conditioning,
+initialize with `conditioning_type="warp"` and pass exactly `window` warp frames
+per call via `warp_video` and optionally `warp_visibility_mask`.
+
+An interactive browser UI is available for prompt-and-button camera control:
+
+```bash
+mysrun -c 8 -g 1 python scripts/web_control.py \
+  --host 0.0.0.0 \
+  --port 7860 \
+  --model_path checkpoints/helios-distilled
+```
+
+Open the printed URL, upload a first frame, enter a prompt, select translation
+and rotation buttons, then click Generate. The server keeps the autoregressive
+state alive between Generate clicks. Generated mp4 files are written under `runs/web_control` by default. 
+
+<video src="assets/webcontrol_demo.mp4" controls muted loop width="100%"></video>
 
 ## Training
 

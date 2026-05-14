@@ -48,6 +48,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto")
     parser.add_argument("--no_lora", action="store_true", help="Run without loading a Warp-as-History LoRA.")
     parser.add_argument(
+        "--warp_debug_dir",
+        type=Path,
+        default=None,
+        help="Optional directory where the pipeline writes warp.mp4 for the warp conditioning debug view.",
+    )
+    parser.add_argument(
         "--enable_optional_attention",
         action="store_true",
         help=(
@@ -308,6 +314,8 @@ def main() -> None:
         "num_frames": num_frames,
         "generator": generator,
         "output_type": "np",
+        "warp_debug_dir": args.warp_debug_dir,
+        "warp_debug_fps": fps,
     }
     if conditioning_type == "warp_video":
         pipe_kwargs["warp_video"] = warp_video

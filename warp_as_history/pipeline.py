@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,6 +17,7 @@ from safetensors.torch import load_file, save_file
 
 from helios.diffusers_version.pipeline_helios_diffusers import (
     XLA_AVAILABLE,
+    HeliosPipelineOutput,
     HeliosPipeline,
     calculate_shift,
     optimized_scale,
@@ -54,6 +56,13 @@ from .defaults import (
 
 if XLA_AVAILABLE:
     import torch_xla.core.xla_model as xm
+
+
+@dataclass
+class WarpAsHistoryPipelineOutput(HeliosPipelineOutput):
+    """Warp-as-History output with optional warp debug tensors."""
+
+    warp_debug: dict[str, Any] | None = None
 
 
 def _normalize_optional_lora_path(lora_path: str | Path | None) -> str | None:
@@ -346,6 +355,130 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             sliced = np.concatenate([sliced, pad], axis=0)
         return sliced
 
+    @staticmethod
+    def _frame_sequence_length(value: torch.Tensor | np.ndarray | None) -> int:
+        if value is None:
+            return 0
+        return int(value.shape[0] if torch.is_tensor(value) else np.asarray(value).shape[0])
+
+    @staticmethod
+    def _last_frame_sequence(value: torch.Tensor | np.ndarray | None) -> torch.Tensor | np.ndarray | None:
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            return value.detach()[-1:].clone()
+        return np.asarray(value)[-1:].copy()
+
+    @staticmethod
+    def _prepend_frame_sequence(
+        prefix: torch.Tensor | np.ndarray,
+        value: torch.Tensor | np.ndarray,
+    ) -> torch.Tensor | np.ndarray:
+        if torch.is_tensor(value):
+            if torch.is_tensor(prefix):
+                prefix_tensor = prefix.detach().to(device=value.device, dtype=value.dtype)
+            else:
+                prefix_tensor = torch.from_numpy(np.asarray(prefix)).to(device=value.device, dtype=value.dtype)
+            return torch.cat([prefix_tensor, value], dim=0)
+
+        array = np.asarray(value)
+        if torch.is_tensor(prefix):
+            prefix_array = prefix.detach().cpu().numpy().astype(array.dtype, copy=False)
+        else:
+            prefix_array = np.asarray(prefix, dtype=array.dtype)
+        return np.concatenate([prefix_array, array], axis=0)
+
+    def _trim_decoded_video(self, video: torch.Tensor) -> torch.Tensor:
+        generated_frames = int(video.size(2))
+        generated_frames = (
+            generated_frames - 1
+        ) // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+        return video[:, :, :generated_frames]
+
+    @staticmethod
+    def _should_capture_warp_debug(state: dict[str, Any]) -> bool:
+        return bool(state.get("return_warp_debug")) or state.get("warp_debug_dir") is not None
+
+    @staticmethod
+    def _detach_debug_video(video: torch.Tensor) -> torch.Tensor:
+        return video.detach().float().cpu().clone()
+
+    def _record_warp_debug_chunk(
+        self,
+        state: dict[str, Any],
+        chunk_index: int,
+        warp_video: torch.Tensor,
+        *,
+        drop_first_frame_for_rollout: bool,
+    ) -> None:
+        if not self._should_capture_warp_debug(state):
+            return
+        state.setdefault("warp_debug_chunks", {})[int(chunk_index)] = {
+            "warp_video": self._detach_debug_video(warp_video),
+            "drop_first_frame_for_rollout": bool(drop_first_frame_for_rollout),
+        }
+
+    @staticmethod
+    def _warp_debug_frames_uint8(warp_video: torch.Tensor) -> list[np.ndarray]:
+        if not torch.is_tensor(warp_video) or warp_video.ndim != 5:
+            raise ValueError(f"warp debug video must be a [B,C,T,H,W] tensor, got {type(warp_video)!r}.")
+        video01 = (warp_video[:1].detach().float().cpu() / 2.0 + 0.5).clamp(0.0, 1.0)
+        if video01.shape[1] == 1:
+            video01 = video01.expand(-1, 3, -1, -1, -1)
+        elif video01.shape[1] > 3:
+            video01 = video01[:, :3]
+        frames = video01[0].permute(1, 2, 3, 0).numpy()
+        return [(frame * 255.0).round().astype(np.uint8) for frame in frames]
+
+    @staticmethod
+    def _write_warp_debug_video(path: Path, warp_video: torch.Tensor, fps: int) -> None:
+        import imageio.v2 as imageio
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frames = WarpAsHistoryPipeline._warp_debug_frames_uint8(warp_video)
+        with imageio.get_writer(str(path), fps=int(fps), codec="libx264", macro_block_size=1) as writer:
+            for frame in frames:
+                writer.append_data(frame)
+
+    def collect_warp_debug(
+        self,
+        state: dict[str, Any],
+        *,
+        save_dir: str | Path | None = None,
+        fps: int = 16,
+    ) -> dict[str, Any]:
+        """Collect recorded warp conditioning frames and optionally save only warp.mp4."""
+        chunks = state.get("warp_debug_chunks")
+        if not chunks:
+            chunks = {}
+            for chunk_index, rendered in sorted(state.get("camera_warp_chunks", {}).items()):
+                if isinstance(rendered, dict) and torch.is_tensor(rendered.get("warp_video")):
+                    chunks[int(chunk_index)] = {
+                        "warp_video": self._detach_debug_video(rendered["warp_video"]),
+                        "drop_first_frame_for_rollout": int(chunk_index) > 0,
+                    }
+        ordered_chunks = [chunks[index] for index in sorted(chunks)]
+        rollout_parts = []
+        for chunk in ordered_chunks:
+            warp_video = chunk["warp_video"]
+            if bool(chunk.get("drop_first_frame_for_rollout")) and int(warp_video.shape[2]) > 1:
+                warp_video = warp_video[:, :, 1:]
+            rollout_parts.append(warp_video)
+        warp_rollout = torch.cat(rollout_parts, dim=2) if rollout_parts else None
+
+        debug = {
+            "warp_video": warp_rollout,
+            "chunks": chunks,
+            "debug_dir": None,
+        }
+        if save_dir is not None:
+            if warp_rollout is None:
+                raise RuntimeError("No warp debug frames were recorded.")
+            debug_dir = Path(save_dir).expanduser()
+            self._write_warp_debug_video(debug_dir / "warp.mp4", warp_rollout, fps=int(fps))
+            debug["debug_dir"] = str(debug_dir)
+        return debug
+
     def _prepare_warp_state(
         self,
         image: PipelineImageInput,
@@ -466,6 +599,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         rendered = state.get("camera_first_chunk_rendered") if int(chunk_index) == 0 else None
         if rendered is None:
             window_num_frames = int(state["window_num_frames"])
+            online_camera_poses = state.get("online_camera_poses")
+            online_target_intrinsics = state.get("online_target_intrinsics")
             if int(chunk_index) == 0:
                 source_pose_index = 0
                 frame_count = window_num_frames
@@ -479,18 +614,32 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 )
                 use_depth_scale = False
 
-            camera_poses = self._slice_frame_sequence(
-                state["camera_poses"],
-                source_pose_index,
-                frame_count,
-                "camera_poses",
-            )
-            target_intrinsics = self._slice_frame_sequence(
-                state.get("target_intrinsics"),
-                source_pose_index,
-                frame_count,
-                "target_intrinsics",
-            )
+            if online_camera_poses is None:
+                camera_poses = self._slice_frame_sequence(
+                    state["camera_poses"],
+                    source_pose_index,
+                    frame_count,
+                    "camera_poses",
+                )
+                target_intrinsics = self._slice_frame_sequence(
+                    state.get("target_intrinsics"),
+                    source_pose_index,
+                    frame_count,
+                    "target_intrinsics",
+                )
+            else:
+                camera_poses = self._slice_frame_sequence(
+                    online_camera_poses,
+                    0,
+                    frame_count,
+                    "camera_poses",
+                )
+                target_intrinsics = self._slice_frame_sequence(
+                    online_target_intrinsics,
+                    0,
+                    frame_count,
+                    "target_intrinsics",
+                )
             geometry = None
             pi3x_keyframe_images = state.get("pi3x_keyframe_images")
             if (
@@ -530,6 +679,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             )
 
         if int(chunk_index) == 0:
+            if isinstance(rendered, dict) and "geometry" in rendered:
+                state["camera_first_frame_geometry"] = rendered["geometry"]
             state["camera_translation_effective_scale"] = float(
                 rendered.get("camera_translation_effective_scale", state["camera_control_translation_scale"])
             )
@@ -541,6 +692,12 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         if visibility_mask is None:
             visibility_mask = self._coerce_visibility_mask(rendered["visibility_frames"])
         visibility_mask = visibility_mask.to(device=device, dtype=torch.float32)
+        self._record_warp_debug_chunk(
+            state,
+            int(chunk_index),
+            warp_video,
+            drop_first_frame_for_rollout=int(chunk_index) > 0,
+        )
         return warp_video, visibility_mask
 
     def _check_minimal_inputs(
@@ -766,6 +923,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 raise RuntimeError("warp_as_history rollout is missing the previous chunk boundary frame.")
             source_frame = source_frame.to(device=device, dtype=torch.float32)
 
+        online_conditioning_type = state.get("online_conditioning_type")
         if state.get("using_camera_warp", False):
             warp_video_chunk, visibility_chunk = self._render_camera_warp_chunk(
                 state=state,
@@ -773,6 +931,13 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 source_frame=source_frame,
                 device=device,
             )
+        elif online_conditioning_type == "warp":
+            warp_video_chunk = state.get("online_warp_video_tensor")
+            visibility_chunk = state.get("online_visibility_mask")
+            if warp_video_chunk is None or visibility_chunk is None:
+                raise RuntimeError("warp_as_history rollout is missing online warp conditioning.")
+            warp_video_chunk = warp_video_chunk.to(device=device, dtype=torch.float32)
+            visibility_chunk = visibility_chunk.to(device=device, dtype=torch.float32)
         else:
             warp_video_tensor = state["warp_video_tensor"]
             visibility_mask = state["visibility_mask"]
@@ -812,6 +977,23 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 prefix_latent = cached_prefix.to(device=device, dtype=prefix_latent.dtype)
 
         if state.get("using_camera_warp", False):
+            latents_mean, latents_std = self._latent_stats(device)
+            _, warp_latents = self.prepare_video_latents(
+                warp_video_chunk,
+                latents_mean=latents_mean,
+                latents_std=latents_std,
+                num_latent_frames_per_chunk=WAH_NUM_LATENT_FRAMES_PER_CHUNK,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            warp_latents = self._add_noise_to_warp_history_latents(
+                state=state,
+                warp_latents=warp_latents,
+                device=device,
+                generator=generator,
+            )
+        elif online_conditioning_type == "warp":
             latents_mean, latents_std = self._latent_stats(device)
             _, warp_latents = self.prepare_video_latents(
                 warp_video_chunk,
@@ -975,10 +1157,704 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         }
 
     @torch.no_grad()
-    def __call__(
+    def init_autoregressive_state(
         self,
         prompt: str | list[str] | None,
         image: PipelineImageInput,
+        *,
+        conditioning_type: str = "camera",
+        lora_path: str | Path | None = None,
+        visible_token_drop: bool = True,
+        rope_alignment: bool = True,
+        warp_invisible_fill: str = "mean_first_frame",
+        height: int = 384,
+        width: int = 640,
+        num_frames: int = WAH_NUM_FRAMES,
+        negative_prompt: str | list[str] | None = WAH_NEGATIVE_PROMPT,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        output_type: str | None = "np",
+        num_videos_per_prompt: int = 1,
+        add_noise_to_image_latents: bool = False,
+        add_noise_to_warp_latents: bool = True,
+        warp_noise_sigma_min: float = 0.111,
+        warp_noise_sigma_max: float = 0.135,
+        is_amplify_first_chunk: bool = True,
+        lora_prompt_trigger: str | None = None,
+        prev_chunk_history_sizes: list[int] | tuple[int, int, int] = WAH_PREV_CHUNK_HISTORY_SIZES,
+        camera_control_translation_scale: float = CAMERA_CONTROL_DEFAULT_TRANSLATION_SCALE,
+        camera_control_translation_scale_use_first_frame_depth: bool = (
+            CAMERA_CONTROL_DEFAULT_TRANSLATION_SCALE_USE_FIRST_FRAME_DEPTH
+        ),
+        camera_control_warp_invisible_fill: str = CAMERA_CONTROL_DEFAULT_WARP_INVISIBLE_FILL,
+        camera_control_warp_render_mode: str = CAMERA_CONTROL_DEFAULT_WARP_RENDER_MODE,
+        camera_control_warp_target_fill_radius: int = CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_RADIUS,
+        camera_control_warp_target_fill_min_neighbors: int = CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_MIN_NEIGHBORS,
+        camera_control_mesh_break_mode: str = CAMERA_CONTROL_DEFAULT_MESH_BREAK_MODE,
+        camera_control_mesh_depth_rtol: float = CAMERA_CONTROL_DEFAULT_MESH_DEPTH_RTOL,
+        camera_control_mesh_normal_tol_deg: float = CAMERA_CONTROL_DEFAULT_MESH_NORMAL_TOL_DEG,
+        camera_control_pi3x_keyframe_memory: bool = CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY,
+        return_warp_debug: bool = False,
+        warp_debug_dir: str | Path | None = None,
+        warp_debug_fps: int = 16,
+    ) -> dict[str, Any]:
+        conditioning_type = str(conditioning_type).strip().lower()
+        if conditioning_type not in {"camera", "warp"}:
+            raise ValueError("conditioning_type must be either 'camera' or 'warp'.")
+        using_camera_warp = conditioning_type == "camera"
+        if using_camera_warp:
+            image = center_crop_resize_first_frame(image, height=int(height), width=int(width))
+            warp_invisible_fill = str(camera_control_warp_invisible_fill)
+
+        if lora_prompt_trigger is None:
+            lora_prompt_trigger = CAMERA_CONTROL_PROMPT_TRIGGER if using_camera_warp else WAH_PROMPT_TRIGGER
+
+        self._check_minimal_inputs(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            num_videos_per_prompt=num_videos_per_prompt,
+        )
+
+        normalized_lora_path = _normalize_optional_lora_path(lora_path)
+        lora_active = self._configure_wah_lora(normalized_lora_path)
+        prompt_for_pipe = (
+            self._add_prompt_trigger(prompt, lora_prompt_trigger) if lora_active and prompt_embeds is None else prompt
+        )
+        attention_kwargs = (
+            {"history_visible_token_threshold": WAH_VISIBLE_TOKEN_THRESHOLD} if bool(visible_token_drop) else None
+        )
+
+        self._guidance_scale = 1.0
+        self._attention_kwargs = attention_kwargs
+        self._current_timestep = None
+        self._interrupt = False
+
+        self.check_inputs(
+            prompt_for_pipe,
+            negative_prompt,
+            int(height),
+            int(width),
+            prompt_embeds,
+            negative_prompt_embeds,
+            ["latents"],
+            image,
+            None,
+            False,
+            num_videos_per_prompt,
+            [7, 7, 7],
+            3,
+            1.0,
+        )
+
+        device = self._execution_device
+        vae_dtype = self.vae.dtype
+        latents_mean, latents_std = self._latent_stats(device)
+
+        if prompt_for_pipe is not None and isinstance(prompt_for_pipe, str):
+            batch_size = 1
+        elif prompt_for_pipe is not None and isinstance(prompt_for_pipe, list):
+            batch_size = len(prompt_for_pipe)
+        else:
+            batch_size = int(prompt_embeds.shape[0])
+
+        all_prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            prompt=prompt_for_pipe,
+            negative_prompt=negative_prompt,
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            num_videos_per_prompt=num_videos_per_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            max_sequence_length=512,
+            device=device,
+        )
+
+        transformer_dtype = self.transformer.dtype
+        all_prompt_embeds = all_prompt_embeds.to(transformer_dtype)
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
+
+        image_tensor = self.video_processor.preprocess(image, height=int(height), width=int(width))
+        image_latents, fake_image_latents = self.prepare_image_latents(
+            image_tensor,
+            latents_mean=latents_mean,
+            latents_std=latents_std,
+            num_latent_frames_per_chunk=WAH_NUM_LATENT_FRAMES_PER_CHUNK,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+        first_frame_image_latents = image_latents
+
+        if bool(add_noise_to_image_latents):
+            image_noise_sigma = torch.rand(1, device=device, generator=generator) * (0.135 - 0.111) + 0.111
+            image_latents = image_noise_sigma * randn_tensor(
+                image_latents.shape,
+                generator=generator,
+                device=device,
+            ) + (1 - image_noise_sigma) * image_latents
+            fake_image_noise_sigma = torch.rand(1, device=device, generator=generator) * (0.135 - 0.111) + 0.111
+            fake_image_latents = fake_image_noise_sigma * randn_tensor(
+                fake_image_latents.shape,
+                generator=generator,
+                device=device,
+            ) + (1 - fake_image_noise_sigma) * fake_image_latents
+
+        history_sizes = sorted(list(WAH_HISTORY_SIZES), reverse=True)
+        num_channels_latents = int(self.transformer.config.in_channels)
+        window_num_frames = (WAH_NUM_LATENT_FRAMES_PER_CHUNK - 1) * self.vae_scale_factor_temporal + 1
+        num_history_latent_frames = int(sum(history_sizes))
+        history_latents = torch.zeros(
+            batch_size,
+            num_channels_latents,
+            num_history_latent_frames,
+            int(height) // self.vae_scale_factor_spatial,
+            int(width) // self.vae_scale_factor_spatial,
+            device=device,
+            dtype=torch.float32,
+        )
+        total_generated_latent_frames = 0
+        if fake_image_latents is not None:
+            history_latents = torch.cat([history_latents[:, :, :-1, :, :], fake_image_latents], dim=2)
+            total_generated_latent_frames += 1
+
+        indices = torch.arange(0, sum([1, *history_sizes, WAH_NUM_LATENT_FRAMES_PER_CHUNK]))
+        (
+            indices_prefix,
+            indices_latents_history_long,
+            indices_latents_history_mid,
+            indices_latents_history_1x,
+            indices_hidden_states,
+        ) = indices.split([1, *history_sizes, WAH_NUM_LATENT_FRAMES_PER_CHUNK], dim=0)
+        indices_latents_history_short = torch.cat([indices_prefix, indices_latents_history_1x], dim=0)
+
+        state = self._prepare_warp_state(
+            image=image,
+            warp_video=None,
+            warp_visibility_mask=None,
+            height=int(height),
+            width=int(width),
+            num_frames=int(num_frames),
+            warp_invisible_fill=str(warp_invisible_fill),
+            visible_token_drop=bool(visible_token_drop),
+            rope_alignment=bool(rope_alignment),
+            prev_chunk_history_sizes=prev_chunk_history_sizes,
+            add_noise_to_warp_latents=bool(add_noise_to_warp_latents),
+            warp_noise_sigma_min=float(warp_noise_sigma_min),
+            warp_noise_sigma_max=float(warp_noise_sigma_max),
+            image_history_prefix_noised=bool(add_noise_to_image_latents),
+            generator=generator,
+            lora_active=bool(lora_active),
+        )
+        state.update(
+            {
+                "conditioning_type": conditioning_type,
+                "online_conditioning_type": None,
+                "generator": generator,
+                "prompt_embeds": all_prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "attention_kwargs": attention_kwargs,
+                "batch_size": batch_size,
+                "num_channels_latents": num_channels_latents,
+                "history_sizes": history_sizes,
+                "num_history_latent_frames": num_history_latent_frames,
+                "history_latents": history_latents,
+                "total_generated_latent_frames": total_generated_latent_frames,
+                "history_video": None,
+                "returned_frame_count": 0,
+                "real_history_latents": None,
+                "image_latents": image_latents,
+                "first_frame_image_latents": first_frame_image_latents,
+                "latents_mean": latents_mean,
+                "latents_std": latents_std,
+                "vae_dtype": vae_dtype,
+                "transformer_dtype": transformer_dtype,
+                "indices_hidden_states": indices_hidden_states.unsqueeze(0),
+                "indices_latents_history_short": indices_latents_history_short.unsqueeze(0),
+                "indices_latents_history_mid": indices_latents_history_mid.unsqueeze(0),
+                "indices_latents_history_long": indices_latents_history_long.unsqueeze(0),
+                "output_type": output_type,
+                "keep_first_frame": True,
+                "pyramid_num_stages": WAH_PYRAMID_NUM_STAGES,
+                "pyramid_num_inference_steps_list": list(WAH_PYRAMID_STEPS),
+                "guidance_scale": 1.0,
+                "use_zero_init": False,
+                "zero_steps": 0,
+                "is_amplify_first_chunk": bool(is_amplify_first_chunk),
+                "lora_active": bool(lora_active),
+                "last_camera_pose": None,
+                "last_target_intrinsic": None,
+                "return_warp_debug": bool(return_warp_debug),
+                "warp_debug_dir": str(Path(warp_debug_dir).expanduser()) if warp_debug_dir is not None else None,
+                "warp_debug_fps": int(warp_debug_fps),
+                "warp_debug_chunks": {},
+            }
+        )
+
+        if using_camera_warp:
+            renderer = self._get_camera_warp_renderer(
+                camera_control_warp_render_mode=camera_control_warp_render_mode,
+                camera_control_warp_target_fill_radius=camera_control_warp_target_fill_radius,
+                camera_control_warp_target_fill_min_neighbors=camera_control_warp_target_fill_min_neighbors,
+                camera_control_mesh_break_mode=camera_control_mesh_break_mode,
+                camera_control_mesh_depth_rtol=float(camera_control_mesh_depth_rtol),
+                camera_control_mesh_normal_tol_deg=float(camera_control_mesh_normal_tol_deg),
+            )
+            source_image_tensor = image_tensor.to(device=device, dtype=torch.float32)
+            state.update(
+                {
+                    "using_camera_warp": True,
+                    "camera_renderer": renderer,
+                    "camera_control_translation_scale": float(camera_control_translation_scale),
+                    "camera_translation_effective_scale": float(camera_control_translation_scale),
+                    "camera_control_translation_scale_use_first_frame_depth": bool(
+                        camera_control_translation_scale_use_first_frame_depth
+                    ),
+                    "camera_control_warp_invisible_fill": str(camera_control_warp_invisible_fill),
+                    "camera_control_warp_render_mode": str(camera_control_warp_render_mode),
+                    "camera_control_warp_target_fill_radius": int(camera_control_warp_target_fill_radius),
+                    "camera_control_warp_target_fill_min_neighbors": int(
+                        camera_control_warp_target_fill_min_neighbors
+                    ),
+                    "camera_control_mesh_break_mode": str(camera_control_mesh_break_mode),
+                    "pi3x_keyframe_images": [source_image_tensor.detach().float().cpu()]
+                    if bool(camera_control_pi3x_keyframe_memory)
+                    else None,
+                    "pi3x_keyframe_last_decoded_chunk": -1,
+                    "pi3x_keyframe_memory_enabled": bool(camera_control_pi3x_keyframe_memory),
+                    "pi3x_keyframe_counts": [],
+                    "pi3x_keyframe_intrinsic_smoothing_stats": [],
+                    "pi3x_keyframe_scale_alignment_stats": [],
+                    "camera_warp_chunks": {},
+                }
+            )
+        return state
+
+    def _prepare_autoregressive_camera_chunk(
+        self,
+        state: dict[str, Any],
+        camera_poses: torch.Tensor | np.ndarray,
+        target_intrinsics: torch.Tensor | np.ndarray | None,
+    ) -> None:
+        if state.get("conditioning_type") != "camera":
+            raise ValueError("This autoregressive state was initialized for warp_video chunks, not camera chunks.")
+        chunk_index = int(state.get("chunk_index", 0))
+        window_num_frames = int(state["window_num_frames"])
+        if chunk_index == 0:
+            prepared_camera_poses = self._slice_frame_sequence(
+                camera_poses,
+                0,
+                window_num_frames,
+                "camera_poses",
+            )
+        else:
+            frame_count = window_num_frames + 1
+            if self._frame_sequence_length(camera_poses) == frame_count:
+                prepared_camera_poses = self._slice_frame_sequence(camera_poses, 0, frame_count, "camera_poses")
+            else:
+                target_camera_poses = self._slice_frame_sequence(
+                    camera_poses,
+                    0,
+                    window_num_frames,
+                    "camera_poses",
+                )
+                last_camera_pose = state.get("last_camera_pose")
+                if last_camera_pose is None:
+                    raise RuntimeError("autoregressive camera state is missing the previous boundary camera pose.")
+                prepared_camera_poses = self._prepend_frame_sequence(last_camera_pose, target_camera_poses)
+
+        prepared_target_intrinsics = None
+        if target_intrinsics is not None:
+            if chunk_index == 0:
+                prepared_target_intrinsics = self._slice_frame_sequence(
+                    target_intrinsics,
+                    0,
+                    window_num_frames,
+                    "target_intrinsics",
+                )
+            else:
+                frame_count = window_num_frames + 1
+                if self._frame_sequence_length(target_intrinsics) == frame_count:
+                    prepared_target_intrinsics = self._slice_frame_sequence(
+                        target_intrinsics,
+                        0,
+                        frame_count,
+                        "target_intrinsics",
+                    )
+                else:
+                    target_intrinsics_chunk = self._slice_frame_sequence(
+                        target_intrinsics,
+                        0,
+                        window_num_frames,
+                        "target_intrinsics",
+                    )
+                    last_target_intrinsic = state.get("last_target_intrinsic")
+                    if last_target_intrinsic is None:
+                        raise RuntimeError(
+                            "autoregressive target_intrinsics after the first chunk must either include the "
+                            "previous boundary intrinsic or be provided from the first chunk so it can be cached."
+                        )
+                    prepared_target_intrinsics = self._prepend_frame_sequence(
+                        last_target_intrinsic,
+                        target_intrinsics_chunk,
+                    )
+
+        state["online_conditioning_type"] = "camera"
+        state["using_camera_warp"] = True
+        state["online_camera_poses"] = prepared_camera_poses
+        state["online_target_intrinsics"] = prepared_target_intrinsics
+        state["_pending_last_camera_pose"] = self._last_frame_sequence(prepared_camera_poses)
+        state["_pending_last_target_intrinsic"] = self._last_frame_sequence(prepared_target_intrinsics)
+
+    def _prepare_autoregressive_warp_chunk(
+        self,
+        state: dict[str, Any],
+        warp_video: Any,
+        warp_visibility_mask: Any | None,
+    ) -> None:
+        if state.get("conditioning_type") != "warp":
+            raise ValueError("This autoregressive state was initialized for camera chunks, not warp_video chunks.")
+        device = self._wah_execution_device()
+        height = int(state["height"])
+        width = int(state["width"])
+        window_num_frames = int(state["window_num_frames"])
+        warp_video_tensor = self._coerce_warp_video_tensor(
+            warp_video,
+            height=height,
+            width=width,
+            device=device,
+        )
+        if warp_video_tensor.shape[0] != 1:
+            raise ValueError("WarpAsHistoryPipeline currently supports batch size 1.")
+        if int(warp_video_tensor.shape[2]) != window_num_frames:
+            raise ValueError(
+                "autoregressive warp_video chunks must contain exactly "
+                f"{window_num_frames} frames, got {int(warp_video_tensor.shape[2])}."
+            )
+
+        visibility_mask = self._coerce_visibility_mask(warp_visibility_mask)
+        if visibility_mask is None:
+            visibility_mask = torch.ones(
+                1,
+                1,
+                window_num_frames,
+                height,
+                width,
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            visibility_mask = self._resize_visibility_mask(
+                visibility_mask,
+                batch_size=warp_video_tensor.shape[0],
+                num_frames=window_num_frames,
+                height=height,
+                width=width,
+                device=device,
+            )
+
+        state["online_conditioning_type"] = "warp"
+        state["using_camera_warp"] = False
+        state["online_warp_video_tensor"] = warp_video_tensor
+        state["online_visibility_mask"] = visibility_mask
+        self._record_warp_debug_chunk(
+            state,
+            int(state.get("chunk_index", 0)),
+            warp_video_tensor,
+            drop_first_frame_for_rollout=False,
+        )
+
+    def _record_decoded_chunk_boundary(self, state: dict[str, Any], decoded_video: torch.Tensor) -> None:
+        if not isinstance(decoded_video, torch.Tensor) or decoded_video.ndim != 5 or decoded_video.shape[2] < 1:
+            return
+        boundary_frame = _display_boundary_frame(decoded_video[:, :, -1])
+        state["prev_chunk_last_frame"] = boundary_frame
+        pi3x_keyframe_images = state.get("pi3x_keyframe_images")
+        if pi3x_keyframe_images is not None:
+            decoded_chunk_index = int(state.get("chunk_index", 0)) - 1
+            last_decoded_chunk = int(state.get("pi3x_keyframe_last_decoded_chunk", -1))
+            if decoded_chunk_index >= 0 and decoded_chunk_index > last_decoded_chunk:
+                pi3x_keyframe_images.append(boundary_frame)
+                state["pi3x_keyframe_last_decoded_chunk"] = decoded_chunk_index
+
+    def _commit_autoregressive_conditioning(self, state: dict[str, Any]) -> None:
+        if state.get("online_conditioning_type") != "camera":
+            return
+        state["last_camera_pose"] = state.get("_pending_last_camera_pose")
+        state["last_target_intrinsic"] = state.get("_pending_last_target_intrinsic")
+
+    def _generate_next_chunk_from_state(self, state: dict[str, Any]) -> torch.Tensor:
+        device = self._execution_device
+        self._guidance_scale = float(state.get("guidance_scale", 1.0))
+        self._attention_kwargs = state.get("attention_kwargs")
+        self._interrupt = False
+
+        history_sizes = list(state["history_sizes"])
+        num_history_latent_frames = int(state["num_history_latent_frames"])
+        history_latents = state["history_latents"]
+        latents_history_long, latents_history_mid, latents_history_1x = history_latents[
+            :, :, -num_history_latent_frames:
+        ].split(history_sizes, dim=2)
+
+        chunk_index = int(state.get("chunk_index", 0))
+        is_first_chunk = chunk_index == 0
+        batch_size = int(state["batch_size"])
+        num_channels_latents = int(state["num_channels_latents"])
+        height = int(state["height"])
+        width = int(state["width"])
+        window_num_frames = int(state["window_num_frames"])
+
+        image_latents = state.get("image_latents")
+        if image_latents is None and is_first_chunk:
+            latents_prefix = torch.zeros(
+                (
+                    batch_size,
+                    num_channels_latents,
+                    1,
+                    latents_history_1x.shape[-2],
+                    latents_history_1x.shape[-1],
+                ),
+                device=device,
+                dtype=latents_history_1x.dtype,
+            )
+        else:
+            latents_prefix = image_latents
+        latents_history_short = torch.cat([latents_prefix, latents_history_1x], dim=2)
+
+        latents = self.prepare_latents(
+            batch_size,
+            num_channels_latents,
+            height,
+            width,
+            window_num_frames,
+            dtype=torch.float32,
+            device=device,
+            generator=state.get("generator"),
+            latents=None,
+        )
+
+        pyramid_steps = list(state["pyramid_num_inference_steps_list"])
+        num_inference_steps = (
+            sum(pyramid_steps) * 2
+            if bool(state.get("is_amplify_first_chunk", False)) and self.config.is_distilled and is_first_chunk
+            else sum(pyramid_steps)
+        )
+
+        previous_wah_state = getattr(self, "_wah_state", None)
+        self._wah_state = state
+        try:
+            with self.progress_bar(total=num_inference_steps) as progress_bar:
+                latents = self.stage2_sample(
+                    latents=latents,
+                    pyramid_num_stages=int(state["pyramid_num_stages"]),
+                    pyramid_num_inference_steps_list=pyramid_steps,
+                    prompt_embeds=state["prompt_embeds"],
+                    negative_prompt_embeds=state.get("negative_prompt_embeds"),
+                    guidance_scale=float(state.get("guidance_scale", 1.0)),
+                    indices_hidden_states=state["indices_hidden_states"],
+                    indices_latents_history_short=state["indices_latents_history_short"],
+                    indices_latents_history_mid=state["indices_latents_history_mid"],
+                    indices_latents_history_long=state["indices_latents_history_long"],
+                    latents_history_short=latents_history_short,
+                    latents_history_mid=latents_history_mid,
+                    latents_history_long=latents_history_long,
+                    attention_kwargs=state.get("attention_kwargs"),
+                    device=device,
+                    transformer_dtype=state["transformer_dtype"],
+                    generator=state.get("generator"),
+                    use_zero_init=bool(state.get("use_zero_init", False)),
+                    zero_steps=int(state.get("zero_steps", 0)),
+                    is_amplify_first_chunk=bool(state.get("is_amplify_first_chunk", False)) and is_first_chunk,
+                    progress_bar=progress_bar,
+                )
+        finally:
+            self._wah_state = previous_wah_state
+
+        first_frame_image_latents = state.get("first_frame_image_latents")
+        if bool(state.get("keep_first_frame", True)) and is_first_chunk and first_frame_image_latents is not None:
+            latents[:, :, 0:1, :, :] = first_frame_image_latents.to(device=latents.device, dtype=latents.dtype)
+
+        state["total_generated_latent_frames"] = int(state["total_generated_latent_frames"]) + int(latents.shape[2])
+        state["history_latents"] = torch.cat([state["history_latents"], latents], dim=2)
+        real_history_latents = state["history_latents"][:, :, -int(state["total_generated_latent_frames"]) :]
+        state["real_history_latents"] = real_history_latents
+        state["last_latents"] = latents
+
+        vae_dtype = self.vae.dtype
+        latents_mean = state["latents_mean"].to(device=device, dtype=vae_dtype)
+        latents_std = state["latents_std"].to(device=device, dtype=vae_dtype)
+        current_latents = (
+            real_history_latents[:, :, -WAH_NUM_LATENT_FRAMES_PER_CHUNK:].to(vae_dtype) / latents_std
+            + latents_mean
+        )
+        current_video = self.vae.decode(current_latents, return_dict=False)[0]
+        self._record_decoded_chunk_boundary(state, current_video)
+        self._commit_autoregressive_conditioning(state)
+
+        history_video = state.get("history_video")
+        if history_video is None:
+            history_video = current_video
+        else:
+            history_video = torch.cat([history_video, current_video], dim=2)
+        state["history_video"] = history_video
+
+        finalized_history_video = self._trim_decoded_video(history_video)
+        returned_frame_count = int(state.get("returned_frame_count", 0))
+        video_delta = finalized_history_video[:, :, returned_frame_count:]
+        state["returned_frame_count"] = int(finalized_history_video.shape[2])
+        state["last_video_delta"] = video_delta
+        return video_delta
+
+    @torch.no_grad()
+    def generate_next_chunk(
+        self,
+        state: dict[str, Any],
+        *,
+        camera_poses: torch.Tensor | np.ndarray | None = None,
+        target_intrinsics: torch.Tensor | np.ndarray | None = None,
+        warp_video: Any | None = None,
+        warp_visibility_mask: Any | None = None,
+        output_type: str | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Generate one autoregressive WAH chunk and return the finalized video delta plus next state."""
+        if not isinstance(state, dict):
+            raise TypeError("state must be created by init_autoregressive_state().")
+        conditioning_type = state.get("conditioning_type")
+        if conditioning_type == "camera":
+            if camera_poses is None:
+                raise ValueError("camera_poses is required for a camera autoregressive state.")
+            if warp_video is not None or warp_visibility_mask is not None:
+                raise ValueError("warp_video inputs cannot be passed to a camera autoregressive state.")
+            self._prepare_autoregressive_camera_chunk(state, camera_poses, target_intrinsics)
+        elif conditioning_type == "warp":
+            if warp_video is None:
+                raise ValueError("warp_video is required for a warp autoregressive state.")
+            if camera_poses is not None or target_intrinsics is not None:
+                raise ValueError("camera inputs cannot be passed to a warp autoregressive state.")
+            self._prepare_autoregressive_warp_chunk(state, warp_video, warp_visibility_mask)
+        else:
+            raise ValueError("state is missing a valid conditioning_type.")
+
+        video_delta = self._generate_next_chunk_from_state(state)
+        selected_output_type = state.get("output_type") if output_type is None else output_type
+        if selected_output_type == "latent":
+            video = state["last_latents"]
+        else:
+            video = self.video_processor.postprocess_video(
+                video_delta.detach().clone(),
+                output_type=selected_output_type,
+            )
+        return video, state
+
+    def finalize_autoregressive_state(
+        self,
+        state: dict[str, Any],
+        *,
+        output_type: str | None = None,
+        return_dict: bool = True,
+        free_model_hooks: bool = True,
+        return_warp_debug: bool | None = None,
+        warp_debug_dir: str | Path | None = None,
+        warp_debug_fps: int | None = None,
+    ) -> Any:
+        selected_output_type = state.get("output_type") if output_type is None else output_type
+        if selected_output_type == "latent":
+            video = state.get("real_history_latents")
+        else:
+            history_video = state.get("history_video")
+            if history_video is None:
+                raise RuntimeError("No autoregressive chunks have been generated yet.")
+            video = self.video_processor.postprocess_video(
+                self._trim_decoded_video(history_video).detach().clone(),
+                output_type=selected_output_type,
+            )
+
+        selected_return_warp_debug = (
+            bool(state.get("return_warp_debug")) if return_warp_debug is None else bool(return_warp_debug)
+        )
+        selected_warp_debug_dir = state.get("warp_debug_dir") if warp_debug_dir is None else warp_debug_dir
+        selected_warp_debug_fps = int(state.get("warp_debug_fps", 16) if warp_debug_fps is None else warp_debug_fps)
+        warp_debug = None
+        if selected_return_warp_debug or selected_warp_debug_dir is not None:
+            warp_debug = self.collect_warp_debug(
+                state,
+                save_dir=selected_warp_debug_dir,
+                fps=selected_warp_debug_fps,
+            )
+
+        self._current_timestep = None
+        self._set_wah_lora_enabled(bool(state.get("lora_active", False)))
+        if bool(free_model_hooks):
+            self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (video, warp_debug) if selected_return_warp_debug else (video,)
+        if selected_return_warp_debug:
+            return WarpAsHistoryPipelineOutput(frames=video, warp_debug=warp_debug)
+        return HeliosPipelineOutput(frames=video)
+
+    def _run_original_helios(
+        self,
+        *,
+        prompt: str | list[str] | None,
+        image: PipelineImageInput | None,
+        warp_visibility_mask: Any | None,
+        target_intrinsics: torch.Tensor | np.ndarray | None,
+        lora_path: str | Path | None,
+        height: int,
+        width: int,
+        num_frames: int,
+        negative_prompt: str | list[str] | None,
+        generator: torch.Generator | list[torch.Generator] | None,
+        prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds: torch.Tensor | None,
+        output_type: str | None,
+        return_dict: bool,
+        num_videos_per_prompt: int,
+        add_noise_to_image_latents: bool,
+        is_amplify_first_chunk: bool,
+        return_warp_debug: bool,
+        warp_debug_dir: str | Path | None,
+        helios_kwargs: dict[str, Any],
+    ) -> Any:
+        if return_warp_debug or warp_debug_dir is not None:
+            raise ValueError("Warp debug requires camera_poses or warp_video; original Helios inference has no warp.")
+        if warp_visibility_mask is not None:
+            raise ValueError("warp_visibility_mask requires warp_video; omit both for original Helios inference.")
+        if target_intrinsics is not None:
+            raise ValueError("target_intrinsics requires camera_poses; omit both for original Helios inference.")
+        if _normalize_optional_lora_path(lora_path) is not None:
+            raise ValueError(
+                "lora_path is only supported for Warp-as-History conditioning. "
+                "Pass camera_poses or warp_video to use a WAH LoRA, or omit lora_path for original Helios inference."
+            )
+
+        self._set_wah_lora_enabled(False)
+        return super().__call__(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=int(height),
+            width=int(width),
+            num_frames=int(num_frames),
+            generator=generator,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            output_type=output_type,
+            return_dict=return_dict,
+            num_videos_per_prompt=num_videos_per_prompt,
+            image=image,
+            add_noise_to_image_latents=bool(add_noise_to_image_latents),
+            is_amplify_first_chunk=bool(is_amplify_first_chunk),
+            **helios_kwargs,
+        )
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        prompt: str | list[str] | None,
+        image: PipelineImageInput | None = None,
         warp_video: Any | None = None,
         *,
         warp_visibility_mask: Any | None = None,
@@ -1017,195 +1893,192 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         camera_control_mesh_depth_rtol: float = CAMERA_CONTROL_DEFAULT_MESH_DEPTH_RTOL,
         camera_control_mesh_normal_tol_deg: float = CAMERA_CONTROL_DEFAULT_MESH_NORMAL_TOL_DEG,
         camera_control_pi3x_keyframe_memory: bool = CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY,
+        return_warp_debug: bool = False,
+        warp_debug_dir: str | Path | None = None,
+        warp_debug_fps: int = 16,
+        **helios_kwargs: Any,
     ) -> Any:
-        using_camera_warp = warp_video is None
-        camera_renderer = None
-        camera_first_chunk_rendered = None
-        if using_camera_warp:
-            if camera_poses is None:
-                raise ValueError("Either warp_video or camera_poses must be provided.")
-            if warp_visibility_mask is not None:
-                raise ValueError("warp_visibility_mask is only supported when warp_video is provided.")
-
-            window_num_frames = (WAH_NUM_LATENT_FRAMES_PER_CHUNK - 1) * self.vae_scale_factor_temporal + 1
-            device = self._wah_execution_device()
-            image = center_crop_resize_first_frame(image, height=int(height), width=int(width))
-            source_image_tensor = self.video_processor.preprocess(
-                image,
-                height=int(height),
-                width=int(width),
-            ).to(device=device, dtype=torch.float32)
-            renderer = self._get_camera_warp_renderer(
-                camera_control_warp_render_mode=camera_control_warp_render_mode,
-                camera_control_warp_target_fill_radius=camera_control_warp_target_fill_radius,
-                camera_control_warp_target_fill_min_neighbors=camera_control_warp_target_fill_min_neighbors,
-                camera_control_mesh_break_mode=camera_control_mesh_break_mode,
-                camera_control_mesh_depth_rtol=float(camera_control_mesh_depth_rtol),
-                camera_control_mesh_normal_tol_deg=float(camera_control_mesh_normal_tol_deg),
-            )
-            first_chunk_intrinsics = self._slice_frame_sequence(
-                target_intrinsics,
-                0,
-                window_num_frames,
-                "target_intrinsics",
-            )
-            camera_first_chunk_rendered = renderer.render(
-                image_tensor=source_image_tensor,
-                camera_poses=camera_poses,
-                height=int(height),
-                width=int(width),
-                num_frames=window_num_frames,
-                device=device,
-                target_intrinsics=first_chunk_intrinsics,
-                translation_scale=float(camera_control_translation_scale),
-                translation_scale_use_first_frame_depth=bool(
-                    camera_control_translation_scale_use_first_frame_depth
-                ),
-                invisible_fill_mode=str(camera_control_warp_invisible_fill),
-                render_mode=str(camera_control_warp_render_mode),
-                target_fill_radius=int(camera_control_warp_target_fill_radius),
-                target_fill_min_neighbors=int(camera_control_warp_target_fill_min_neighbors),
-                mesh_break_mode=str(camera_control_mesh_break_mode),
-            )
-            self._last_camera_warp = camera_first_chunk_rendered
-            camera_renderer = renderer
-            warp_invisible_fill = str(camera_control_warp_invisible_fill)
-        elif camera_poses is not None:
-            raise ValueError("Pass either warp_video or camera_poses, not both.")
-
-        if lora_prompt_trigger is None:
-            lora_prompt_trigger = CAMERA_CONTROL_PROMPT_TRIGGER if using_camera_warp else WAH_PROMPT_TRIGGER
-
-        self._check_minimal_inputs(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            num_videos_per_prompt=num_videos_per_prompt,
-        )
-
-        normalized_lora_path = _normalize_optional_lora_path(lora_path)
-        lora_active = self._configure_wah_lora(normalized_lora_path)
-        prompt_for_pipe = (
-            self._add_prompt_trigger(prompt, lora_prompt_trigger) if lora_active and prompt_embeds is None else prompt
-        )
-        attention_kwargs = (
-            {"history_visible_token_threshold": WAH_VISIBLE_TOKEN_THRESHOLD} if bool(visible_token_drop) else None
-        )
-
-        self._wah_state = self._prepare_warp_state(
-            image=image,
-            warp_video=warp_video,
-            warp_visibility_mask=warp_visibility_mask,
-            height=int(height),
-            width=int(width),
-            num_frames=int(num_frames),
-            warp_invisible_fill=str(warp_invisible_fill),
-            visible_token_drop=bool(visible_token_drop),
-            rope_alignment=bool(rope_alignment),
-            prev_chunk_history_sizes=prev_chunk_history_sizes,
-            add_noise_to_warp_latents=bool(add_noise_to_warp_latents),
-            warp_noise_sigma_min=float(warp_noise_sigma_min),
-            warp_noise_sigma_max=float(warp_noise_sigma_max),
-            image_history_prefix_noised=bool(add_noise_to_image_latents),
-            generator=generator,
-            lora_active=bool(lora_active),
-        )
-        if using_camera_warp:
-            self._wah_state.update(
-                {
-                    "using_camera_warp": True,
-                    "camera_renderer": camera_renderer,
-                    "camera_poses": camera_poses,
-                    "target_intrinsics": target_intrinsics,
-                    "camera_first_chunk_rendered": camera_first_chunk_rendered,
-                    "camera_first_frame_geometry": camera_first_chunk_rendered["geometry"],
-                    "camera_translation_effective_scale": float(
-                        camera_first_chunk_rendered.get(
-                            "camera_translation_effective_scale",
-                            camera_control_translation_scale,
-                        )
-                    ),
-                    "camera_control_translation_scale": float(camera_control_translation_scale),
-                    "camera_control_translation_scale_use_first_frame_depth": bool(
-                        camera_control_translation_scale_use_first_frame_depth
-                    ),
-                    "camera_control_warp_invisible_fill": str(camera_control_warp_invisible_fill),
-                    "camera_control_warp_render_mode": str(camera_control_warp_render_mode),
-                    "camera_control_warp_target_fill_radius": int(camera_control_warp_target_fill_radius),
-                    "camera_control_warp_target_fill_min_neighbors": int(
-                        camera_control_warp_target_fill_min_neighbors
-                    ),
-                    "camera_control_mesh_break_mode": str(camera_control_mesh_break_mode),
-                    "pi3x_keyframe_images": [source_image_tensor.detach().float().cpu()]
-                    if bool(camera_control_pi3x_keyframe_memory)
-                    else None,
-                    "pi3x_keyframe_last_decoded_chunk": -1,
-                    "pi3x_keyframe_memory_enabled": bool(camera_control_pi3x_keyframe_memory),
-                    "pi3x_keyframe_counts": [],
-                    "pi3x_keyframe_intrinsic_smoothing_stats": [],
-                    "pi3x_keyframe_scale_alignment_stats": [],
-                    "camera_warp_chunks": {0: camera_first_chunk_rendered},
-                }
-            )
-        original_vae_decode = self.vae.decode
-
-        def wah_wrapped_decode(*args, **kwargs):
-            decoded = original_vae_decode(*args, **kwargs)
-            state = getattr(self, "_wah_state", None)
-            decoded_video = decoded[0] if isinstance(decoded, tuple) else decoded.sample
-            if (
-                state is not None
-                and isinstance(decoded_video, torch.Tensor)
-                and decoded_video.ndim == 5
-                and decoded_video.shape[2] >= 1
-            ):
-                boundary_frame = _display_boundary_frame(decoded_video[:, :, -1])
-                state["prev_chunk_last_frame"] = boundary_frame
-                pi3x_keyframe_images = state.get("pi3x_keyframe_images")
-                if pi3x_keyframe_images is not None:
-                    decoded_chunk_index = int(state.get("chunk_index", 0)) - 1
-                    last_decoded_chunk = int(state.get("pi3x_keyframe_last_decoded_chunk", -1))
-                    if decoded_chunk_index >= 0 and decoded_chunk_index > last_decoded_chunk:
-                        pi3x_keyframe_images.append(boundary_frame)
-                        state["pi3x_keyframe_last_decoded_chunk"] = decoded_chunk_index
-            return decoded
-
-        self.vae.decode = wah_wrapped_decode
-        try:
-            return super().__call__(
-                prompt=prompt_for_pipe,
-                negative_prompt=negative_prompt,
+        if warp_video is None and camera_poses is None:
+            return self._run_original_helios(
+                prompt=prompt,
+                image=image,
+                warp_visibility_mask=warp_visibility_mask,
+                target_intrinsics=target_intrinsics,
+                lora_path=lora_path,
                 height=int(height),
                 width=int(width),
                 num_frames=int(num_frames),
-                guidance_scale=1.0,
-                num_videos_per_prompt=num_videos_per_prompt,
+                negative_prompt=negative_prompt,
                 generator=generator,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
                 output_type=output_type,
                 return_dict=return_dict,
-                attention_kwargs=attention_kwargs,
-                image=image,
+                num_videos_per_prompt=num_videos_per_prompt,
                 add_noise_to_image_latents=bool(add_noise_to_image_latents),
-                image_noise_sigma_min=0.111,
-                image_noise_sigma_max=0.135,
-                history_sizes=list(WAH_HISTORY_SIZES),
-                num_latent_frames_per_chunk=WAH_NUM_LATENT_FRAMES_PER_CHUNK,
-                keep_first_frame=True,
-                is_skip_first_chunk=False,
-                is_enable_stage2=True,
-                pyramid_num_stages=WAH_PYRAMID_NUM_STAGES,
-                pyramid_num_inference_steps_list=list(WAH_PYRAMID_STEPS),
-                use_zero_init=False,
-                zero_steps=0,
                 is_amplify_first_chunk=bool(is_amplify_first_chunk),
+                return_warp_debug=bool(return_warp_debug),
+                warp_debug_dir=warp_debug_dir,
+                helios_kwargs=helios_kwargs,
+            )
+        if helios_kwargs:
+            unsupported = ", ".join(sorted(helios_kwargs))
+            raise ValueError(
+                "Original Helios arguments are only supported when neither warp_video nor camera_poses is provided: "
+                f"{unsupported}."
+            )
+        if image is None:
+            raise ValueError("image is required when using Warp-as-History conditioning.")
+
+        using_camera_warp = warp_video is None
+        if using_camera_warp:
+            if camera_poses is None:
+                raise ValueError("Either warp_video or camera_poses must be provided.")
+            if warp_visibility_mask is not None:
+                raise ValueError("warp_visibility_mask is only supported when warp_video is provided.")
+        elif camera_poses is not None:
+            raise ValueError("Pass either warp_video or camera_poses, not both.")
+
+        state = self.init_autoregressive_state(
+            prompt=prompt,
+            image=image,
+            conditioning_type="camera" if using_camera_warp else "warp",
+            lora_path=lora_path,
+            visible_token_drop=bool(visible_token_drop),
+            rope_alignment=bool(rope_alignment),
+            warp_invisible_fill=str(warp_invisible_fill),
+            height=int(height),
+            width=int(width),
+            num_frames=int(num_frames),
+            negative_prompt=negative_prompt,
+            generator=generator,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            output_type=output_type,
+            num_videos_per_prompt=num_videos_per_prompt,
+            add_noise_to_image_latents=bool(add_noise_to_image_latents),
+            add_noise_to_warp_latents=bool(add_noise_to_warp_latents),
+            warp_noise_sigma_min=float(warp_noise_sigma_min),
+            warp_noise_sigma_max=float(warp_noise_sigma_max),
+            is_amplify_first_chunk=bool(is_amplify_first_chunk),
+            lora_prompt_trigger=lora_prompt_trigger,
+            prev_chunk_history_sizes=prev_chunk_history_sizes,
+            camera_control_translation_scale=float(camera_control_translation_scale),
+            camera_control_translation_scale_use_first_frame_depth=bool(
+                camera_control_translation_scale_use_first_frame_depth
+            ),
+            camera_control_warp_invisible_fill=str(camera_control_warp_invisible_fill),
+            camera_control_warp_render_mode=str(camera_control_warp_render_mode),
+            camera_control_warp_target_fill_radius=int(camera_control_warp_target_fill_radius),
+            camera_control_warp_target_fill_min_neighbors=int(camera_control_warp_target_fill_min_neighbors),
+            camera_control_mesh_break_mode=str(camera_control_mesh_break_mode),
+            camera_control_mesh_depth_rtol=float(camera_control_mesh_depth_rtol),
+            camera_control_mesh_normal_tol_deg=float(camera_control_mesh_normal_tol_deg),
+            camera_control_pi3x_keyframe_memory=bool(camera_control_pi3x_keyframe_memory),
+            return_warp_debug=bool(return_warp_debug),
+            warp_debug_dir=warp_debug_dir,
+            warp_debug_fps=int(warp_debug_fps),
+        )
+
+        num_chunks = int(state["num_warp_chunks"])
+        window_num_frames = int(state["window_num_frames"])
+        warp_video_tensor = None
+        visibility_mask = None
+        if not using_camera_warp:
+            device = self._wah_execution_device()
+            total_warp_frames = num_chunks * window_num_frames
+            warp_video_tensor = self._coerce_warp_video_tensor(
+                warp_video,
+                height=int(height),
+                width=int(width),
+                device=device,
+            )
+            if warp_video_tensor.shape[0] != 1:
+                raise ValueError("WarpAsHistoryPipeline currently supports batch size 1.")
+            if int(warp_video_tensor.shape[2]) != total_warp_frames:
+                raise ValueError(
+                    "warp_video must contain exactly one full warp rollout for the requested frame count: "
+                    f"{total_warp_frames} frames for num_frames={int(num_frames)} "
+                    f"({num_chunks} chunks x {window_num_frames} frames)."
+                )
+            visibility_mask = self._coerce_visibility_mask(warp_visibility_mask)
+            if visibility_mask is None:
+                visibility_mask = torch.ones(
+                    1,
+                    1,
+                    total_warp_frames,
+                    int(height),
+                    int(width),
+                    device=device,
+                    dtype=torch.float32,
+                )
+            else:
+                visibility_mask = self._resize_visibility_mask(
+                    visibility_mask,
+                    batch_size=warp_video_tensor.shape[0],
+                    num_frames=total_warp_frames,
+                    height=int(height),
+                    width=int(width),
+                    device=device,
+                )
+
+        try:
+            for chunk_index in range(num_chunks):
+                frame_start = chunk_index * window_num_frames
+                if using_camera_warp:
+                    if chunk_index == 0:
+                        chunk_camera_poses = self._slice_frame_sequence(
+                            camera_poses,
+                            0,
+                            window_num_frames,
+                            "camera_poses",
+                        )
+                        chunk_target_intrinsics = self._slice_frame_sequence(
+                            target_intrinsics,
+                            0,
+                            window_num_frames,
+                            "target_intrinsics",
+                        )
+                    else:
+                        chunk_camera_poses = self._slice_frame_sequence(
+                            camera_poses,
+                            frame_start - 1,
+                            window_num_frames + 1,
+                            "camera_poses",
+                        )
+                        chunk_target_intrinsics = self._slice_frame_sequence(
+                            target_intrinsics,
+                            frame_start - 1,
+                            window_num_frames + 1,
+                            "target_intrinsics",
+                        )
+                    self.generate_next_chunk(
+                        state,
+                        camera_poses=chunk_camera_poses,
+                        target_intrinsics=chunk_target_intrinsics,
+                        output_type="latent",
+                    )
+                else:
+                    frame_end = frame_start + window_num_frames
+                    self.generate_next_chunk(
+                        state,
+                        warp_video=warp_video_tensor[:, :, frame_start:frame_end],
+                        warp_visibility_mask=visibility_mask[:, :, frame_start:frame_end],
+                        output_type="latent",
+                    )
+
+            return self.finalize_autoregressive_state(
+                state,
+                output_type=output_type,
+                return_dict=return_dict,
+                free_model_hooks=True,
+                return_warp_debug=bool(return_warp_debug),
+                warp_debug_dir=warp_debug_dir,
+                warp_debug_fps=int(warp_debug_fps),
             )
         finally:
-            self.vae.decode = original_vae_decode
             self._wah_state = None
-            self._set_wah_lora_enabled(bool(lora_active))
+            self._set_wah_lora_enabled(bool(state.get("lora_active", False)))
 
     def stage2_sample(
         self,
