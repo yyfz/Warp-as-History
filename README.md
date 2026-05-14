@@ -52,7 +52,15 @@ pip install -e third_party/Pi3
 `git submodule update --init --recursive`.
 
 `xformers` and `flash-attn` are optional. The default code path uses PyTorch
-native attention.
+native attention. In our CUDA 12.4 / PyTorch 2.5.1 setup, this FlashAttention
+version works:
+
+```bash
+pip install "flash-attn==2.7.4.post1" --no-build-isolation
+```
+
+For other CUDA/PyTorch setups, install a `flash-attn` version compatible with
+your environment.
 
 ## Models
 
