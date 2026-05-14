@@ -1,4 +1,23 @@
-# Warp-as-History
+<div align="center">
+<h1>
+  <span class="title-lead title-mark">Warp-as-History:</span>
+  <span class="title-rest">Generalizable Camera-Controlled Video Generation</span>
+  <span class="title-tail">from <span class="title-highlight">One</span> Training Video</span>
+</h1>
+<p class="eyebrow">Video History is More Than Context.</p>
+<p class="authors"><a href="https://yyfz.github.io/">Yifan Wang</a><sup>1,2</sup> and <a href="https://tonghe90.github.io/">Tong He</a><sup>2,3</sup></p>
+<p class="affiliations">
+  <span><sup>1</sup> Shanghai Jiao Tong University</span>
+  <span><sup>2</sup> Shanghai AI Laboratory</span>
+  <span><sup>3</sup> Shanghai Innovation Institute</span>
+</p>
+<img src="assets/github_teaser.jpg" alt="Warp-as-History teaser" width="100%">
+<p>
+  <a href="https://yyfz.github.io/warp-as-history" style="display:inline-block; padding:10px 18px; border-radius:999px; background:#111111; color:#ffffff; font-weight:600; text-decoration:none;">
+    See More Demo&nbsp;&#8599;
+  </a>
+</p>
+</div>
 
 Warp-as-History is a Helios-based video generation pipeline with Pi3X camera
 warp conditioning. It supports inference with online Pi3X warps and LoRA
@@ -81,6 +100,9 @@ Each demo CSV has these columns:
 first_frame_path,prompt,camera_poses_path,warp_video_path,warp_visibility_mask_path
 ```
 
+`camera_poses_path` should point to an `.npz` file whose `camera_poses` entry
+contains OpenCV `c2w` poses with shape `[T, 4, 4]`.
+
 When both `warp_video_path` and `camera_poses_path` are provided, inference uses
 the pre-rendered warp video. Without `--output`, the script writes
 `runs/<csv_stem>.mp4`. By default it uses the warp video frame count, or all
@@ -98,9 +120,13 @@ video = pipe(
     prompt="a car driving through a roundabout",
     image=first_frame,
     camera_poses=camera_poses,
+    camera_control_translation_scale=0.1,
     lora_path="/path/to/visible_lora_state.pt",
 )
 ```
+
+`camera_control_translation_scale` controls the online warp translation scale
+and defaults to `0.1`.
 
 By default, Helios is loaded from `checkpoints/helios-distilled` and Pi3X is
 loaded from `checkpoints/pi3x/model.safetensors`.
@@ -131,3 +157,14 @@ python scripts/train_warp_as_history_lora.py \
 
 The training script writes `train_config.json`, `train_loss.json`,
 `visible_lora_state.pt`, and step checkpoints when `--save_every` is enabled.
+
+## License
+
+- Helios code and weights follow the upstream Helios license:
+  https://github.com/PKU-YuanGroup/Helios?tab=readme-ov-file
+- Pi3X code and weights follow the upstream Pi3 license:
+  https://github.com/yyfz/Pi3
+- Warp-as-History code authored in this repository is licensed under
+  Apache-2.0; see [LICENSE](LICENSE).
+- LoRA weights are released under CC BY-NC 4.0 and are strictly
+  non-commercial.
