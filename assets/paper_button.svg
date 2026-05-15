@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="142" height="44" viewBox="0 0 142 44" role="img" aria-label="Paper">
+  <defs>
+    <linearGradient id="button-fill" x1="0" y1="0" x2="142" y2="44" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#20232a"/>
+      <stop offset="1" stop-color="#0b0d12"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="140" height="42" rx="21" fill="url(#button-fill)"/>
+  <rect x="1.5" y="1.5" width="139" height="41" rx="20.5" fill="none" stroke="#ffffff" stroke-opacity="0.14"/>
+  <path d="M28 13H39L47 21V31C47 32.1 46.1 33 45 33H28C26.9 33 26 32.1 26 31V15C26 13.9 26.9 13 28 13Z" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linejoin="round"/>
+  <path d="M39 13V21H47" fill="none" stroke="#ffffff" stroke-width="1.7" stroke-linejoin="round"/>
+  <path d="M31 25H42M31 29H38" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round"/>
+  <text x="58" y="28" fill="#ffffff" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="15" font-weight="650" letter-spacing="0">Paper</text>
+  <circle cx="113" cy="22" r="12" fill="#ffffff" fill-opacity="0.12"/>
+  <path d="M108 27L118 17M111 17H118V24" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

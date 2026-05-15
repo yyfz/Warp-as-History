@@ -13,6 +13,9 @@
 </p>
 <img src="assets/github_teaser.jpg" alt="Warp-as-History teaser" width="100%">
 <p>
+  <a href="https://arxiv.org/abs/2605.15182">
+    <img src="assets/paper_button.svg" alt="Paper" height="44">
+  </a>
   <a href="https://yyfz.github.io/warp-as-history">
     <img src="assets/demo_button.svg" alt="See More Demo" height="44">
   </a>
@@ -260,11 +263,14 @@ The training script writes `train_config.json`, `train_loss.json`,
 If you find this work useful, please cite:
 
 ```bibtex
-@article{wang2026warpasHistory,
-  title={Warp-as-History: Generalizable Camera-Controlled Video Generation from One Training Video},
-  author={Wang, Yifan and He, Tong},
-  journal={arXiv preprint arXiv:},
-  year={2026}
+@misc{wang2026warpashistorygeneralizablecameracontrolledvideo,
+      title={Warp-as-History: Generalizable Camera-Controlled Video Generation from One Training Video}, 
+      author={Yifan Wang and Tong He},
+      year={2026},
+      eprint={2605.15182},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2605.15182}, 
 }
 ```
 
