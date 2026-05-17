@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 
-WAH_PROMPT_TRIGGER = "wah."
+WAH_PROMPT_TRIGGER = "camctl23x."
+WAH_DEFAULT_LORA_PATH = "checkpoints/warp-as-history/visible_lora_state_step1000.safetensors"
 
 WAH_NEGATIVE_PROMPT = (
     "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, "

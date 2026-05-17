@@ -143,12 +143,13 @@ video = pipe(
     image=first_frame,
     camera_poses=camera_poses,
     camera_control_translation_scale=0.1,
-    lora_path="checkpoints/warp-as-history/visible_lora_state_step1000.safetensors",
 )
 ```
 
 `camera_control_translation_scale` controls the online warp translation scale
-and defaults to `0.1`.
+and defaults to `0.1`. Warp-as-History conditioning loads the default LoRA
+from `checkpoints/warp-as-history/visible_lora_state_step1000.safetensors`
+unless you pass `lora_path=None` or another disabled value such as `"off"`.
 
 If neither `camera_poses` nor `warp_video` is provided,
 `WarpAsHistoryPipeline` falls back to the original Helios pipeline. This path
@@ -163,9 +164,9 @@ video = pipe(
 )
 ```
 
-Passing `lora_path` without `camera_poses` or `warp_video` raises an error,
-because WAH LoRA weights are only defined for Warp-as-History conditioning.
-Original Helios keyword arguments, such as `guidance_scale` and
+Passing an explicit `lora_path` without `camera_poses` or `warp_video` raises
+an error, because WAH LoRA weights are only defined for Warp-as-History
+conditioning. Original Helios keyword arguments, such as `guidance_scale` and
 `num_inference_steps`, are passed through on this fallback path.
 
 To save the warp conditioning used by a Warp-as-History run, pass
