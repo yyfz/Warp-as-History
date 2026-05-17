@@ -259,6 +259,24 @@ python scripts/train_warp_as_history_lora.py \
 The training script writes `train_config.json`, `train_loss.json`,
 `visible_lora_state.pt`, and step checkpoints when `--save_every` is enabled.
 
+## GPU memory
+
+The numbers below were measured on a clean single GPU with Helios-Distilled,
+BF16, `384x640`, 33 frames, and no CPU/offload mode unless noted.
+
+| Run | Peak VRAM |
+| --- | ---: |
+| Original Helios I2V | 46.1 GB |
+| Warp-as-History with pre-rendered `warp_video_path` | 46.1 GB |
+| Warp-as-History with online `camera_poses_path` | 53.6 GB |
+| Helios-Mid LoRA training, 1 step | 48.7 GB |
+
+Pre-rendered warp inference has essentially the same memory footprint as the
+original Helios pipeline. Online camera inference is higher because Pi3X and
+the camera-warp renderer stay resident together with Helios. Helios' low-VRAM
+group-offloading mode is a different configuration and is not included in this
+table.
+
 ## Citation
 
 If you find this work useful, please cite:
