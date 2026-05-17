@@ -41,6 +41,7 @@ from .camera_warp import (
 )
 from .defaults import (
     LORA_DISABLED_VALUES,
+    WAH_DEFAULT_LORA_PATH,
     WAH_HISTORY_SIZES,
     WAH_INVISIBLE_FILL_MODES,
     WAH_NEGATIVE_PROMPT,
@@ -54,6 +55,9 @@ from .defaults import (
 )
 
 
+LORA_AUTO_VALUES = frozenset({"auto", "default"})
+
+
 if XLA_AVAILABLE:
     import torch_xla.core.xla_model as xm
 
@@ -65,12 +69,24 @@ class WarpAsHistoryPipelineOutput(HeliosPipelineOutput):
     warp_debug: dict[str, Any] | None = None
 
 
+def _is_auto_lora_path(lora_path: str | Path | None) -> bool:
+    if lora_path is None:
+        return False
+    return str(lora_path).strip().lower() in LORA_AUTO_VALUES
+
+
+def _default_wah_lora_path() -> str:
+    return str((Path(__file__).resolve().parents[1] / WAH_DEFAULT_LORA_PATH).resolve())
+
+
 def _normalize_optional_lora_path(lora_path: str | Path | None) -> str | None:
     if lora_path is None:
         return None
     lora_path_str = str(lora_path)
     if lora_path_str.strip().lower() in LORA_DISABLED_VALUES:
         return None
+    if lora_path_str.strip().lower() in LORA_AUTO_VALUES:
+        return _default_wah_lora_path()
     return lora_path_str
 
 
@@ -1207,7 +1223,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         image: PipelineImageInput,
         *,
         conditioning_type: str = "camera",
-        lora_path: str | Path | None = None,
+        lora_path: str | Path | None = "auto",
         visible_token_drop: bool = True,
         rope_alignment: bool = True,
         warp_invisible_fill: str = "mean_first_frame",
@@ -1217,6 +1233,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         negative_prompt: str | list[str] | None = WAH_NEGATIVE_PROMPT,
         generator: torch.Generator | list[torch.Generator] | None = None,
         prompt_embeds: torch.Tensor | None = None,
+        lora_prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         output_type: str | None = "np",
         num_videos_per_prompt: int = 1,
@@ -1251,9 +1268,6 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             image = center_crop_resize_first_frame(image, height=int(height), width=int(width))
             warp_invisible_fill = str(camera_control_warp_invisible_fill)
 
-        if lora_prompt_trigger is None:
-            lora_prompt_trigger = CAMERA_CONTROL_PROMPT_TRIGGER if using_camera_warp else WAH_PROMPT_TRIGGER
-
         self._check_minimal_inputs(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -1264,8 +1278,21 @@ class WarpAsHistoryPipeline(HeliosPipeline):
 
         normalized_lora_path = _normalize_optional_lora_path(lora_path)
         lora_active = self._configure_wah_lora(normalized_lora_path)
-        prompt_for_pipe = (
-            self._add_prompt_trigger(prompt, lora_prompt_trigger) if lora_active and prompt_embeds is None else prompt
+        if lora_prompt_embeds is not None and lora_prompt_embeds.shape[0] != 1:
+            raise ValueError("WarpAsHistoryPipeline currently supports lora_prompt_embeds batch size 1.")
+        if lora_prompt_embeds is not None and not lora_active:
+            raise ValueError("lora_prompt_embeds is only supported when lora_path enables a WAH LoRA.")
+        if lora_active and prompt_embeds is not None and lora_prompt_embeds is None:
+            raise ValueError(
+                "When lora_path is active, prompt_embeds must be paired with explicit lora_prompt_embeds "
+                "encoded from the same prompt plus the LoRA trigger."
+            )
+        if lora_prompt_trigger is None:
+            lora_prompt_trigger = CAMERA_CONTROL_PROMPT_TRIGGER
+        lora_prompt_for_pipe = (
+            self._add_prompt_trigger(prompt, lora_prompt_trigger)
+            if lora_active and lora_prompt_embeds is None
+            else None
         )
         attention_kwargs = (
             {"history_visible_token_threshold": WAH_VISIBLE_TOKEN_THRESHOLD} if bool(visible_token_drop) else None
@@ -1277,7 +1304,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         self._interrupt = False
 
         self.check_inputs(
-            prompt_for_pipe,
+            prompt,
             negative_prompt,
             int(height),
             int(width),
@@ -1297,15 +1324,15 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         vae_dtype = self.vae.dtype
         latents_mean, latents_std = self._latent_stats(device)
 
-        if prompt_for_pipe is not None and isinstance(prompt_for_pipe, str):
+        if prompt is not None and isinstance(prompt, str):
             batch_size = 1
-        elif prompt_for_pipe is not None and isinstance(prompt_for_pipe, list):
-            batch_size = len(prompt_for_pipe)
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
         else:
             batch_size = int(prompt_embeds.shape[0])
 
         all_prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-            prompt=prompt_for_pipe,
+            prompt=prompt,
             negative_prompt=negative_prompt,
             do_classifier_free_guidance=self.do_classifier_free_guidance,
             num_videos_per_prompt=num_videos_per_prompt,
@@ -1319,6 +1346,25 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         all_prompt_embeds = all_prompt_embeds.to(transformer_dtype)
         if negative_prompt_embeds is not None:
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
+        if lora_prompt_for_pipe is not None:
+            lora_prompt_embeds, _ = self.encode_prompt(
+                prompt=lora_prompt_for_pipe,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                num_videos_per_prompt=num_videos_per_prompt,
+                prompt_embeds=None,
+                negative_prompt_embeds=negative_prompt_embeds,
+                max_sequence_length=512,
+                device=device,
+            )
+            lora_prompt_embeds = lora_prompt_embeds.to(device=device, dtype=transformer_dtype)
+        elif lora_prompt_embeds is not None:
+            lora_prompt_embeds = lora_prompt_embeds.to(device=device, dtype=transformer_dtype)
+        if lora_prompt_embeds is not None and lora_prompt_embeds.shape != all_prompt_embeds.shape:
+            raise ValueError(
+                "lora_prompt_embeds must have the same shape as prompt_embeds after encoding: "
+                f"got {tuple(lora_prompt_embeds.shape)} vs {tuple(all_prompt_embeds.shape)}."
+            )
 
         image_tensor = self.video_processor.preprocess(image, height=int(height), width=int(width))
         image_latents, fake_image_latents = self.prepare_image_latents(
@@ -1398,6 +1444,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 "online_conditioning_type": None,
                 "generator": generator,
                 "prompt_embeds": all_prompt_embeds,
+                "lora_prompt_embeds": lora_prompt_embeds,
                 "negative_prompt_embeds": negative_prompt_embeds,
                 "attention_kwargs": attention_kwargs,
                 "batch_size": batch_size,
@@ -1904,7 +1951,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         warp_visibility_mask: Any | None = None,
         camera_poses: torch.Tensor | np.ndarray | None = None,
         target_intrinsics: torch.Tensor | np.ndarray | None = None,
-        lora_path: str | Path | None = None,
+        lora_path: str | Path | None = "auto",
         visible_token_drop: bool = True,
         rope_alignment: bool = True,
         warp_invisible_fill: str = "mean_first_frame",
@@ -1914,6 +1961,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         negative_prompt: str | list[str] | None = WAH_NEGATIVE_PROMPT,
         generator: torch.Generator | list[torch.Generator] | None = None,
         prompt_embeds: torch.Tensor | None = None,
+        lora_prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         output_type: str | None = "np",
         return_dict: bool = True,
@@ -1943,12 +1991,14 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         **helios_kwargs: Any,
     ) -> Any:
         if warp_video is None and camera_poses is None:
+            if lora_prompt_embeds is not None:
+                raise ValueError("lora_prompt_embeds is only supported for Warp-as-History conditioning.")
             return self._run_original_helios(
                 prompt=prompt,
                 image=image,
                 warp_visibility_mask=warp_visibility_mask,
                 target_intrinsics=target_intrinsics,
-                lora_path=lora_path,
+                lora_path=None if _is_auto_lora_path(lora_path) else lora_path,
                 height=int(height),
                 width=int(width),
                 num_frames=int(num_frames),
@@ -1997,6 +2047,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             negative_prompt=negative_prompt,
             generator=generator,
             prompt_embeds=prompt_embeds,
+            lora_prompt_embeds=lora_prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             output_type=output_type,
             num_videos_per_prompt=num_videos_per_prompt,
@@ -2292,12 +2343,17 @@ class WarpAsHistoryPipeline(HeliosPipeline):
 
                     timestep = t.expand(latents.shape[0]).to(torch.int64)
                     model_latents = latents.to(transformer_dtype)
+                    current_prompt_embeds = (
+                        state.get("lora_prompt_embeds")
+                        if use_wah_lora and state.get("lora_prompt_embeds") is not None
+                        else prompt_embeds
+                    )
 
                     with self.transformer.cache_context("cond"):
                         noise_pred = self.transformer(
                             hidden_states=model_latents,
                             timestep=timestep,
-                            encoder_hidden_states=prompt_embeds,
+                            encoder_hidden_states=current_prompt_embeds,
                             attention_kwargs=attention_kwargs,
                             return_dict=False,
                             indices_hidden_states=current_indices_hidden_states,
