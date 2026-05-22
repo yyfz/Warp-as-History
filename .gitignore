@@ -3,4 +3,5 @@ __pycache__/
 /.codex/
 /runs/
 /checkpoints/
+/data/training/prompt_cache/
 env.sh
