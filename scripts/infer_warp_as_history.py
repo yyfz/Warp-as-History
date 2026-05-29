@@ -49,6 +49,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto")
     parser.add_argument("--no_lora", action="store_true", help="Run without loading a Warp-as-History LoRA.")
     parser.add_argument(
+        "--pyramid_num_inference_steps_list",
+        type=int,
+        nargs=3,
+        default=None,
+        metavar=("S0", "S1", "S2"),
+        help="Override Helios pyramid inference steps, for example: 1 1 1.",
+    )
+    parser.add_argument(
+        "--no_amplify_first_chunk",
+        action="store_false",
+        dest="amplify_first_chunk",
+        default=True,
+        help="Disable first-chunk amplification for faster inference.",
+    )
+    parser.add_argument(
+        "--warp_history_downsample_mode",
+        choices=["short", "patch_mid"],
+        default="short",
+        help="Use patch_mid with a LoRA trained using the efficient Warp-as-History recipe.",
+    )
+    parser.add_argument(
         "--warp_debug_dir",
         type=Path,
         default=None,
@@ -236,9 +257,13 @@ def resolve_lora_path(lora_path: str | Path | None) -> str | None:
     if not path.is_absolute():
         path = REPO_ROOT / path
     path = Path(str(path.absolute()))
-    checkpoints_root = Path(str((REPO_ROOT / "checkpoints").absolute()))
-    if not path.is_relative_to(checkpoints_root):
-        raise ValueError(f"--lora_path must be under {checkpoints_root}, got {path}")
+    allowed_roots = [
+        Path(str((REPO_ROOT / "checkpoints").absolute())),
+        Path(str((REPO_ROOT / "runs").absolute())),
+    ]
+    if not any(path.is_relative_to(root) for root in allowed_roots):
+        roots_text = ", ".join(str(root) for root in allowed_roots)
+        raise ValueError(f"--lora_path must be under one of: {roots_text}; got {path}")
     if not path.is_file():
         raise FileNotFoundError(f"Missing LoRA checkpoint: {path}. Run `python scripts/check_models.py`.")
     return str(path)
@@ -334,9 +359,13 @@ def main() -> None:
         "num_frames": num_frames,
         "generator": generator,
         "output_type": "np",
+        "warp_history_downsample_mode": str(args.warp_history_downsample_mode),
+        "is_amplify_first_chunk": bool(args.amplify_first_chunk),
         "warp_debug_dir": args.warp_debug_dir,
         "warp_debug_fps": fps,
     }
+    if args.pyramid_num_inference_steps_list is not None:
+        pipe_kwargs["pyramid_num_inference_steps_list"] = list(args.pyramid_num_inference_steps_list)
     if conditioning_type == "warp_video":
         pipe_kwargs["warp_video"] = warp_video
         pipe_kwargs["warp_visibility_mask"] = warp_visibility_mask
@@ -355,6 +384,9 @@ def main() -> None:
                 "image": str(image_path),
                 "output": str(output),
                 "lora_path": lora_path,
+                "warp_history_downsample_mode": str(args.warp_history_downsample_mode),
+                "pyramid_num_inference_steps_list": args.pyramid_num_inference_steps_list,
+                "amplify_first_chunk": bool(args.amplify_first_chunk),
                 "frames": len(frames),
                 "conditioning_frames": conditioning_frames,
                 "num_frames": num_frames,

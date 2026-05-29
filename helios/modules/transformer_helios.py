@@ -1466,9 +1466,13 @@ class HeliosTransformer3DModel(
     ):
         history_threshold = 0.5
         history_invisible_token_mode = "none"
+        history_visible_token_mode = "drop"
         if attention_kwargs:
             history_threshold = float(attention_kwargs.get("history_visible_token_threshold", 0.5) or 0.5)
             history_invisible_token_mode = str(attention_kwargs.get("history_invisible_token_mode", "none") or "none")
+            history_visible_token_mode = str(attention_kwargs.get("history_visible_token_mode", "drop") or "drop")
+        if history_visible_token_mode not in {"drop", "none"}:
+            raise ValueError(f"Unsupported history_visible_token_mode: {history_visible_token_mode}")
         height_list = []
         width_list = []
         temporal_list = []
@@ -1574,6 +1578,7 @@ class HeliosTransformer3DModel(
             latents_history_short = latents_history_short.to(hidden_states)
             latents_history_short = self.gradient_checkpointing_method(self.patch_short, latents_history_short)
             _, _, _, H1, W1 = latents_history_short.shape
+            mask_pool_size = (1, 2, 2)
             latents_history_short = latents_history_short.flatten(2).transpose(1, 2)
 
             rope_freqs_history_short = self.rope(
@@ -1583,7 +1588,11 @@ class HeliosTransformer3DModel(
                 device=latents_history_short.device,
             )
             rope_freqs_history_short = rope_freqs_history_short.flatten(2).transpose(1, 2)
-            keep_mask_short = pool_history_visible_mask(history_visible_mask_short, (1, 2, 2))
+            keep_mask_short = (
+                pool_history_visible_mask(history_visible_mask_short, mask_pool_size)
+                if history_visible_token_mode == "drop" or history_invisible_token_mode != "none"
+                else None
+            )
             if history_invisible_token_mode == "global":
                 latents_history_short = replace_history_tokens_by_mask(
                     latents_history_short,
@@ -1591,7 +1600,7 @@ class HeliosTransformer3DModel(
                     getattr(self, "history_invisible_token", None),
                     threshold=history_threshold,
                 )
-            else:
+            elif history_visible_token_mode == "drop":
                 latents_history_short, rope_freqs_history_short = filter_history_tokens_by_mask(
                     latents_history_short,
                     rope_freqs_history_short,
@@ -1610,6 +1619,9 @@ class HeliosTransformer3DModel(
             and indices_latents_history_mid.shape[-1] > 0
         ):
             latents_history_mid = latents_history_mid.to(hidden_states)
+            _, _, _, mid_h, mid_w = latents_history_mid.shape
+            H1 = math.ceil(mid_h / 2)
+            W1 = math.ceil(mid_w / 2)
             latents_history_mid = pad_for_3d_conv(latents_history_mid, (2, 4, 4))
             latents_history_mid = self.gradient_checkpointing_method(self.patch_mid, latents_history_mid)
             latents_history_mid = latents_history_mid.flatten(2).transpose(1, 2)
@@ -1650,6 +1662,9 @@ class HeliosTransformer3DModel(
             and indices_latents_history_long.shape[-1] > 0
         ):
             latents_history_long = latents_history_long.to(hidden_states)
+            _, _, _, long_h, long_w = latents_history_long.shape
+            H1 = math.ceil(long_h / 2)
+            W1 = math.ceil(long_w / 2)
             latents_history_long = pad_for_3d_conv(latents_history_long, (4, 8, 8))
             latents_history_long = self.gradient_checkpointing_method(self.patch_long, latents_history_long)
             latents_history_long = latents_history_long.flatten(2).transpose(1, 2)

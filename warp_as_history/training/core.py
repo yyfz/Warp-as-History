@@ -85,6 +85,8 @@ DEFAULT_TRAINING_ARGS = {
     "history_positioning": "none",
     "history_position_count": 9,
     "history_position_delta": 1,
+    "warp_history_downsample_mode": "short",
+    "visible_token_mode": "drop",
     "save_every": 500,
     "seed": 42,
     "shuffle": True,
@@ -595,24 +597,46 @@ def make_histories(pipe, image_latents, fake_image_latents, args, device, video_
             )
 
         prefix_index = torch.zeros(1, device=device, dtype=torch.long)
+        use_patch_mid_warp = str(getattr(args, "warp_history_downsample_mode", "short") or "short") == "patch_mid"
+        indices_warp_history = indices_latents_history_short
+        visible_history_warp = visible_history_short
+
+        short_latent_parts = [latents_prefix]
+        short_index_parts = [prefix_index]
+        short_visible_parts = None
+        if visible_history_warp is not None:
+            short_visible_parts = [torch.ones(batch_size, 1, 1, h, w, device=device, dtype=torch.float32)]
+
         if short_size > 0:
-            latents_history_short = torch.cat([latents_prefix, latents_history_prev_short, warp_latents], dim=2)
-            indices_latents_history_short = torch.cat(
-                [prefix_index, indices_latents_history_prev_short, indices_latents_history_short],
-                dim=0,
-            )
-            if visible_history_short is not None:
-                prefix_visible = torch.ones(batch_size, 1, 1, h, w, device=device, dtype=torch.float32)
+            short_latent_parts.append(latents_history_prev_short)
+            short_index_parts.append(indices_latents_history_prev_short)
+            if short_visible_parts is not None:
                 prev_short_visible = torch.zeros(batch_size, 1, short_size, h, w, device=device, dtype=torch.float32)
                 if fake_prev_short_count > 0:
                     prev_short_visible[:, :, -fake_prev_short_count:] = 1.0
-                visible_history_short = torch.cat([prefix_visible, prev_short_visible, visible_history_short], dim=2)
+                short_visible_parts.append(prev_short_visible)
+
+        if use_patch_mid_warp:
+            mid_latent_parts = [latents_history_mid]
+            mid_index_parts = [indices_latents_history_mid]
+            mid_visible_parts = [visible_history_mid] if visible_history_warp is not None else None
+            mid_latent_parts.append(warp_latents)
+            mid_index_parts.append(indices_warp_history)
+            if mid_visible_parts is not None:
+                mid_visible_parts.append(visible_history_warp)
+            latents_history_mid = torch.cat(mid_latent_parts, dim=2)
+            indices_latents_history_mid = torch.cat(mid_index_parts, dim=0)
+            visible_history_mid = torch.cat(mid_visible_parts, dim=2) if mid_visible_parts is not None else None
         else:
-            latents_history_short = torch.cat([latents_prefix, warp_latents], dim=2)
-            indices_latents_history_short = torch.cat([prefix_index, indices_latents_history_short], dim=0)
-            if visible_history_short is not None:
-                prefix_visible = torch.ones(batch_size, 1, 1, h, w, device=device, dtype=torch.float32)
-                visible_history_short = torch.cat([prefix_visible, visible_history_short], dim=2)
+            short_latent_parts.append(warp_latents)
+            short_index_parts.append(indices_warp_history)
+            if short_visible_parts is not None:
+                short_visible_parts.append(visible_history_warp)
+
+        latents_history_short = torch.cat(short_latent_parts, dim=2)
+        indices_latents_history_short = torch.cat(short_index_parts, dim=0)
+        visible_history_short = torch.cat(short_visible_parts, dim=2) if short_visible_parts is not None else None
+        has_mid_history = int(latents_history_mid.shape[2]) > 0
         item = {
             "event": "history_prepared",
             "history_sizes": history_sizes,
@@ -620,7 +644,7 @@ def make_histories(pipe, image_latents, fake_image_latents, args, device, video_
             "video_history_latent_frames": int(video_frames),
             "fake_image_history_latent_frames": int(fake_prev_short_count),
             "short_history_shape": list(latents_history_short.shape),
-            "mid_history_shape": None if mid_size == 0 else list(latents_history_mid.shape),
+            "mid_history_shape": None if not has_mid_history else list(latents_history_mid.shape),
             "long_history_shape": None if long_size == 0 else list(latents_history_long.shape),
             "indices_history_short": indices_latents_history_short.detach().cpu().tolist(),
             "indices_history_mid": indices_latents_history_mid.detach().cpu().tolist(),
@@ -636,38 +660,38 @@ def make_histories(pipe, image_latents, fake_image_latents, args, device, video_
             visibility_threshold = float(args.history_invisible_token_threshold)
             visibility_mode = str(args.history_invisible_token_mode)
         if visibility_threshold is not None:
-            short_keep = _estimate_patch_keep(visible_history_short, (1, 2, 2), visibility_threshold)
+            short_mask_pool_size = (1, 2, 2)
+            short_keep = _estimate_patch_keep(visible_history_short, short_mask_pool_size, visibility_threshold)
             mid_keep = _estimate_patch_keep(visible_history_mid, (2, 4, 4), visibility_threshold)
             long_keep = _estimate_patch_keep(visible_history_long, (4, 8, 8), visibility_threshold)
-            item.update(
-                {
-                    "history_visibility_mode": visibility_mode,
-                    "history_visible_token_threshold": visibility_threshold,
-                    "history_short_keep_ratio_estimate": None
-                    if short_keep is None
-                    else float(short_keep.float().mean().cpu()),
-                    "history_mid_keep_ratio_estimate": None
-                    if mid_keep is None
-                    else float(mid_keep.float().mean().cpu()),
-                    "history_long_keep_ratio_estimate": None
-                    if long_keep is None
-                    else float(long_keep.float().mean().cpu()),
-                    "history_short_keep_count_estimate": None
-                    if short_keep is None
-                    else int(short_keep.sum().item()),
-                    "history_mid_keep_count_estimate": None if mid_keep is None else int(mid_keep.sum().item()),
-                    "history_long_keep_count_estimate": None if long_keep is None else int(long_keep.sum().item()),
-                }
-            )
+            visibility_item = {
+                "history_visibility_mode": visibility_mode,
+                "history_visible_token_threshold": visibility_threshold,
+                "history_short_keep_ratio_estimate": None
+                if short_keep is None
+                else float(short_keep.float().mean().cpu()),
+                "history_mid_keep_ratio_estimate": None
+                if mid_keep is None
+                else float(mid_keep.float().mean().cpu()),
+                "history_long_keep_ratio_estimate": None
+                if long_keep is None
+                else float(long_keep.float().mean().cpu()),
+                "history_short_keep_count_estimate": None if short_keep is None else int(short_keep.sum().item()),
+                "history_mid_keep_count_estimate": None if mid_keep is None else int(mid_keep.sum().item()),
+                "history_long_keep_count_estimate": None if long_keep is None else int(long_keep.sum().item()),
+            }
+            if short_mask_pool_size != (1, 2, 2):
+                visibility_item["history_short_mask_pool_size"] = list(short_mask_pool_size)
+            item.update(visibility_item)
         print(json.dumps(item), flush=True)
 
         return {
             "indices_hidden_states": indices_hidden_states.unsqueeze(0),
             "indices_latents_history_short": indices_latents_history_short.unsqueeze(0),
-            "indices_latents_history_mid": indices_latents_history_mid.unsqueeze(0) if mid_size > 0 else None,
+            "indices_latents_history_mid": indices_latents_history_mid.unsqueeze(0) if has_mid_history else None,
             "indices_latents_history_long": indices_latents_history_long.unsqueeze(0) if long_size > 0 else None,
             "latents_history_short": latents_history_short.to(dtype=history_dtype),
-            "latents_history_mid": latents_history_mid.to(dtype=history_dtype) if mid_size > 0 else None,
+            "latents_history_mid": latents_history_mid.to(dtype=history_dtype) if has_mid_history else None,
             "latents_history_long": latents_history_long.to(dtype=history_dtype) if long_size > 0 else None,
             "history_visible_mask_short": visible_history_short,
             "history_visible_mask_mid": visible_history_mid,
@@ -877,29 +901,29 @@ def make_histories(pipe, image_latents, fake_image_latents, args, device, video_
         visibility_threshold = float(args.history_invisible_token_threshold)
         visibility_mode = str(args.history_invisible_token_mode)
     if visibility_threshold is not None:
-        short_keep = _estimate_patch_keep(visible_history_short, (1, 2, 2), visibility_threshold)
+        short_mask_pool_size = (1, 2, 2)
+        short_keep = _estimate_patch_keep(visible_history_short, short_mask_pool_size, visibility_threshold)
         mid_keep = _estimate_patch_keep(visible_history_mid, (2, 4, 4), visibility_threshold)
         long_keep = _estimate_patch_keep(visible_history_long, (4, 8, 8), visibility_threshold)
-        item.update(
-            {
-                "history_visibility_mode": visibility_mode,
-                "history_visible_token_threshold": visibility_threshold,
-                "history_short_keep_ratio_estimate": None
-                if short_keep is None
-                else float(short_keep.float().mean().cpu()),
-                "history_mid_keep_ratio_estimate": None
-                if mid_keep is None
-                else float(mid_keep.float().mean().cpu()),
-                "history_long_keep_ratio_estimate": None
-                if long_keep is None
-                else float(long_keep.float().mean().cpu()),
-                "history_short_keep_count_estimate": None
-                if short_keep is None
-                else int(short_keep.sum().item()),
-                "history_mid_keep_count_estimate": None if mid_keep is None else int(mid_keep.sum().item()),
-                "history_long_keep_count_estimate": None if long_keep is None else int(long_keep.sum().item()),
-            }
-        )
+        visibility_item = {
+            "history_visibility_mode": visibility_mode,
+            "history_visible_token_threshold": visibility_threshold,
+            "history_short_keep_ratio_estimate": None
+            if short_keep is None
+            else float(short_keep.float().mean().cpu()),
+            "history_mid_keep_ratio_estimate": None
+            if mid_keep is None
+            else float(mid_keep.float().mean().cpu()),
+            "history_long_keep_ratio_estimate": None
+            if long_keep is None
+            else float(long_keep.float().mean().cpu()),
+            "history_short_keep_count_estimate": None if short_keep is None else int(short_keep.sum().item()),
+            "history_mid_keep_count_estimate": None if mid_keep is None else int(mid_keep.sum().item()),
+            "history_long_keep_count_estimate": None if long_keep is None else int(long_keep.sum().item()),
+        }
+        if short_mask_pool_size != (1, 2, 2):
+            visibility_item["history_short_mask_pool_size"] = list(short_mask_pool_size)
+        item.update(visibility_item)
     print(json.dumps(item), flush=True)
 
     return {
@@ -1160,6 +1184,19 @@ def flow_matching_loss_train_exact(
     timesteps = [item["timesteps"] for item in stage_items]
     targets = [item["target"] for item in stage_items]
     sigmas = [item["sigmas"] for item in stage_items]
+    warp_history_downsample_mode = str(getattr(args, "warp_history_downsample_mode", "short") or "short")
+    history_visible_token_mode = str(getattr(args, "visible_token_mode", "drop") or "drop")
+    history_invisible_token_mode = str(getattr(args, "history_invisible_token_mode", "none") or "none")
+    attention_kwargs = None
+    if warp_history_downsample_mode != "short":
+        stats["warp_history_downsample_mode"] = warp_history_downsample_mode
+    if history_visible_token_mode != "drop" or history_invisible_token_mode != "none":
+        attention_kwargs = {
+            "history_visible_token_mode": history_visible_token_mode,
+            "history_visible_token_threshold": float(getattr(args, "history_visible_token_threshold", 0.5)),
+            "history_invisible_token_mode": history_invisible_token_mode,
+        }
+        stats["history_visible_token_mode"] = history_visible_token_mode
 
     model_pred = transformer_model_forward(
         pipe,
@@ -1167,7 +1204,7 @@ def flow_matching_loss_train_exact(
         timesteps,
         prompt_embeds,
         histories,
-        attention_kwargs=None,
+        attention_kwargs=attention_kwargs,
         target_channel_fusion_latents=None,
         is_first_denoising_step=False,
     )
@@ -1358,6 +1395,10 @@ def validate_args(args):
         raise ValueError("--history_position_count must be non-negative.")
     if int(args.history_position_delta) < 0:
         raise ValueError("--history_position_delta must be non-negative.")
+    if str(getattr(args, "warp_history_downsample_mode", "short") or "short") not in {"short", "patch_mid"}:
+        raise ValueError("--warp_history_downsample_mode must be one of: short, patch_mid.")
+    if str(getattr(args, "visible_token_mode", "drop") or "drop") not in {"drop", "none"}:
+        raise ValueError("--visible_token_mode must be one of: drop, none.")
     for prefix in ("image", "video"):
         sigma_min = float(getattr(args, f"{prefix}_noise_sigma_min", 0.111))
         sigma_max = float(getattr(args, f"{prefix}_noise_sigma_max", 0.135))

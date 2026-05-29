@@ -71,6 +71,7 @@ your environment.
 - Helios-Distilled (default): [`BestWishYsh/Helios-Distilled`](https://huggingface.co/BestWishYsh/Helios-Distilled/tree/main)
 - Pi3X: [`yyfz233/Pi3X`](https://huggingface.co/yyfz233/Pi3X)
 - Warp-as-History LoRA (default): [`yyfz233/warp-as-history`](https://huggingface.co/yyfz233/warp-as-history)
+- Warp-as-History efficient patch-mid LoRA (optional): [`visible_lora_state_step1000_efficient_patchmid.pt`](https://huggingface.co/yyfz233/warp-as-history/blob/main/visible_lora_state_step1000_efficient_patchmid.pt)
 - Helios-Mid (optional, training only): [`BestWishYsh/Helios-Mid`](https://huggingface.co/BestWishYsh/Helios-Mid)
 
 Download the required models once before inference or training:
@@ -83,6 +84,10 @@ huggingface-cli download yyfz233/Pi3X model.safetensors \
   --local-dir checkpoints/pi3x
 
 huggingface-cli download yyfz233/warp-as-history visible_lora_state_step1000.safetensors \
+  --local-dir checkpoints/warp-as-history
+
+# optional: released efficient patch-mid LoRA for efficient inference
+huggingface-cli download yyfz233/warp-as-history visible_lora_state_step1000_efficient_patchmid.pt \
   --local-dir checkpoints/warp-as-history
 
 # only for training
@@ -254,8 +259,50 @@ python scripts/train_warp_as_history_lora.py \
   --overwrite
 ```
 
+To train the optional efficient LoRA, add `--warp_history_downsample_mode patch_mid`.
+Use that LoRA for efficient inference by passing the same mode, for example
+`python scripts/infer_warp_as_history.py demo.csv --lora_path runs/warp_as_history_lora_efficient/visible_lora_state.pt --warp_history_downsample_mode patch_mid`.
+You can also download the released efficient checkpoint
+`visible_lora_state_step1000_efficient_patchmid.pt` from
+[`yyfz233/warp-as-history`](https://huggingface.co/yyfz233/warp-as-history/blob/main/visible_lora_state_step1000_efficient_patchmid.pt)
+and pass it as `--lora_path checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt`.
+
 The training script writes `train_config.json`, `train_loss.json`,
 `visible_lora_state.pt`, and step checkpoints when `--save_every` is enabled.
+
+### H200 realtime recipe
+
+For realtime H200 deployment, first follow the upstream Helios performance
+setup and verify that the base Helios pipeline reaches about 20 FPS in your
+environment. Use the FlashAttention 3 kernel recommended by the Helios
+repository for Hopper/H200-class GPUs, set the pyramid inference steps from
+`[2, 2, 2]` to `[1, 1, 1]`, and disable first-chunk amplification.
+
+Train the efficient Warp-as-History LoRA:
+
+```bash
+python scripts/train_warp_as_history_lora.py \
+  --prompt_csv data/training/training_data.csv \
+  --data_root data/training \
+  --output_dir runs/warp_as_history_lora_efficient \
+  --max_steps 1000 \
+  --save_every 1000 \
+  --log_every 10 \
+  --warp_history_downsample_mode patch_mid \
+  --overwrite
+```
+
+Run efficient realtime inference with the matching LoRA:
+
+```bash
+python scripts/infer_warp_as_history.py data/demo/angel.csv \
+  --output runs/angel_h200_realtime.mp4 \
+  --lora_path checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt \
+  --warp_history_downsample_mode patch_mid \
+  --pyramid_num_inference_steps_list 1 1 1 \
+  --no_amplify_first_chunk \
+  --enable_optional_attention
+```
 
 ## GPU memory
 

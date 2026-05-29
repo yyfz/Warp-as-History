@@ -178,12 +178,19 @@ def parse_args():
     parser.add_argument("--history_positioning", choices=["none", "last_n", "last_n_same_order"], default="last_n_same_order")
     parser.add_argument("--history_position_count", type=int, default=9)
     parser.add_argument("--history_position_delta", type=int, default=0)
+    parser.add_argument(
+        "--warp_history_downsample_mode",
+        choices=["short", "patch_mid"],
+        default="short",
+        help="Use patch_mid to train the efficient Warp-as-History LoRA; default preserves the release recipe.",
+    )
     parser.add_argument("--add_noise_to_video_latents", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--image_noise_sigma_min", type=float, default=0.111)
     parser.add_argument("--image_noise_sigma_max", type=float, default=0.135)
     parser.add_argument("--video_noise_sigma_min", type=float, default=0.111)
     parser.add_argument("--video_noise_sigma_max", type=float, default=0.135)
     parser.add_argument("--visible_token_drop", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--visible_token_mode", choices=["drop", "none"], default="drop")
     parser.add_argument("--visible_token_threshold", type=float, default=0.1)
     parser.add_argument("--direction_augmentation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--direction_reverse_probability", type=float, default=0.5)
@@ -239,12 +246,14 @@ def build_exact_args(args):
     exact.history_positioning = args.history_positioning
     exact.history_position_count = int(args.history_position_count)
     exact.history_position_delta = int(args.history_position_delta)
+    exact.warp_history_downsample_mode = str(args.warp_history_downsample_mode)
     exact.add_noise_to_video_latents = bool(args.add_noise_to_video_latents)
     exact.image_noise_sigma_min = float(args.image_noise_sigma_min)
     exact.image_noise_sigma_max = float(args.image_noise_sigma_max)
     exact.video_noise_sigma_min = float(args.video_noise_sigma_min)
     exact.video_noise_sigma_max = float(args.video_noise_sigma_max)
     exact.history_visible_token_drop = bool(args.visible_token_drop)
+    exact.visible_token_mode = str(args.visible_token_mode)
     exact.history_visible_token_threshold = float(args.visible_token_threshold)
     exact.history_invisible_token_mode = "none"
     exact.history_invisible_token_threshold = float(args.visible_token_threshold)

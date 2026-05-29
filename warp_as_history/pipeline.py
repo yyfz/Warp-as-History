@@ -1172,6 +1172,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 f"prefix={tuple(prefix_latent.shape)}, warp={tuple(warp_latents.shape)}."
             )
 
+        use_patch_mid_warp = str(state.get("warp_history_downsample_mode", "short") or "short") == "patch_mid"
+
         short_indices_parts = [torch.zeros(1, device=device, dtype=torch.long)]
         short_history_parts = [prefix_latent]
         short_visible_parts = [] if state["visible_token_drop"] else None
@@ -1192,25 +1194,45 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             short_history_parts.append(prev_short)
             if short_visible_parts is not None:
                 short_visible_parts.append(prev_visible_short)
-        short_indices_parts.append(warp_indices)
-        short_history_parts.append(warp_latents)
-        if short_visible_parts is not None:
-            short_visible_parts.append(visibility_latents)
+
+        mid_indices_parts = []
+        mid_history_parts = []
+        mid_visible_parts = [] if state["visible_token_drop"] else None
+        if mid_size > 0:
+            mid_indices_parts.append(prev_mid_indices)
+            mid_history_parts.append(prev_mid)
+            if mid_visible_parts is not None:
+                mid_visible_parts.append(prev_visible_mid)
+
+        if use_patch_mid_warp:
+            mid_indices_parts.append(warp_indices)
+            mid_history_parts.append(warp_latents)
+            if mid_visible_parts is not None:
+                mid_visible_parts.append(visibility_latents)
+        else:
+            short_indices_parts.append(warp_indices)
+            short_history_parts.append(warp_latents)
+            if short_visible_parts is not None:
+                short_visible_parts.append(visibility_latents)
+
+        latents_history_mid = torch.cat(mid_history_parts, dim=2) if mid_history_parts else None
+        indices_latents_history_mid = torch.cat(mid_indices_parts, dim=0).unsqueeze(0) if mid_indices_parts else None
+        history_visible_mask_mid = None
+        if mid_visible_parts is not None and mid_visible_parts:
+            history_visible_mask_mid = torch.cat(mid_visible_parts, dim=2)
 
         return {
             "indices_hidden_states": indices_hidden_states,
             "indices_latents_history_short": torch.cat(short_indices_parts, dim=0).unsqueeze(0),
-            "indices_latents_history_mid": prev_mid_indices.unsqueeze(0) if mid_size > 0 else None,
+            "indices_latents_history_mid": indices_latents_history_mid,
             "indices_latents_history_long": prev_long_indices.unsqueeze(0) if long_size > 0 else None,
             "latents_history_short": torch.cat(short_history_parts, dim=2),
-            "latents_history_mid": prev_mid if mid_size > 0 else None,
+            "latents_history_mid": latents_history_mid,
             "latents_history_long": prev_long if long_size > 0 else None,
             "history_visible_mask_short": None
             if short_visible_parts is None
             else torch.cat(short_visible_parts, dim=2),
-            "history_visible_mask_mid": None
-            if not state["visible_token_drop"] or mid_size <= 0
-            else prev_visible_mid,
+            "history_visible_mask_mid": history_visible_mask_mid,
             "history_visible_mask_long": None
             if not state["visible_token_drop"] or long_size <= 0
             else prev_visible_long,
@@ -1225,6 +1247,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         conditioning_type: str = "camera",
         lora_path: str | Path | None = "auto",
         visible_token_drop: bool = True,
+        warp_history_downsample_mode: str = "short",
         rope_alignment: bool = True,
         warp_invisible_fill: str = "mean_first_frame",
         height: int = 384,
@@ -1242,6 +1265,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         warp_noise_sigma_min: float = 0.111,
         warp_noise_sigma_max: float = 0.135,
         is_amplify_first_chunk: bool = True,
+        pyramid_num_inference_steps_list: list[int] | tuple[int, ...] | None = None,
         lora_prompt_trigger: str | None = None,
         prev_chunk_history_sizes: list[int] | tuple[int, int, int] = WAH_PREV_CHUNK_HISTORY_SIZES,
         camera_control_translation_scale: float = CAMERA_CONTROL_DEFAULT_TRANSLATION_SCALE,
@@ -1294,6 +1318,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             if lora_active and lora_prompt_embeds is None
             else None
         )
+        warp_history_downsample_mode = str(warp_history_downsample_mode or "short")
+        if warp_history_downsample_mode not in {"short", "patch_mid"}:
+            raise ValueError("warp_history_downsample_mode must be one of: short, patch_mid.")
         attention_kwargs = (
             {"history_visible_token_threshold": WAH_VISIBLE_TOKEN_THRESHOLD} if bool(visible_token_drop) else None
         )
@@ -1438,6 +1465,18 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             generator=generator,
             lora_active=bool(lora_active),
         )
+        if pyramid_num_inference_steps_list is None:
+            pyramid_steps = list(WAH_PYRAMID_STEPS)
+        else:
+            pyramid_steps = [int(step) for step in pyramid_num_inference_steps_list]
+            if len(pyramid_steps) != WAH_PYRAMID_NUM_STAGES:
+                raise ValueError(
+                    "pyramid_num_inference_steps_list must contain "
+                    f"{WAH_PYRAMID_NUM_STAGES} values, got {len(pyramid_steps)}."
+                )
+            if any(step <= 0 for step in pyramid_steps):
+                raise ValueError("pyramid_num_inference_steps_list values must be positive.")
+
         state.update(
             {
                 "conditioning_type": conditioning_type,
@@ -1447,6 +1486,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 "lora_prompt_embeds": lora_prompt_embeds,
                 "negative_prompt_embeds": negative_prompt_embeds,
                 "attention_kwargs": attention_kwargs,
+                "warp_history_downsample_mode": warp_history_downsample_mode,
                 "batch_size": batch_size,
                 "num_channels_latents": num_channels_latents,
                 "history_sizes": history_sizes,
@@ -1469,7 +1509,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 "output_type": output_type,
                 "keep_first_frame": True,
                 "pyramid_num_stages": WAH_PYRAMID_NUM_STAGES,
-                "pyramid_num_inference_steps_list": list(WAH_PYRAMID_STEPS),
+                "pyramid_num_inference_steps_list": pyramid_steps,
                 "guidance_scale": 1.0,
                 "use_zero_init": False,
                 "zero_steps": 0,
@@ -1953,6 +1993,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         target_intrinsics: torch.Tensor | np.ndarray | None = None,
         lora_path: str | Path | None = "auto",
         visible_token_drop: bool = True,
+        warp_history_downsample_mode: str = "short",
         rope_alignment: bool = True,
         warp_invisible_fill: str = "mean_first_frame",
         height: int = 384,
@@ -1971,6 +2012,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         warp_noise_sigma_min: float = 0.111,
         warp_noise_sigma_max: float = 0.135,
         is_amplify_first_chunk: bool = True,
+        pyramid_num_inference_steps_list: list[int] | tuple[int, ...] | None = None,
         lora_prompt_trigger: str | None = None,
         prev_chunk_history_sizes: list[int] | tuple[int, int, int] = WAH_PREV_CHUNK_HISTORY_SIZES,
         camera_control_translation_scale: float = CAMERA_CONTROL_DEFAULT_TRANSLATION_SCALE,
@@ -1993,6 +2035,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         if warp_video is None and camera_poses is None:
             if lora_prompt_embeds is not None:
                 raise ValueError("lora_prompt_embeds is only supported for Warp-as-History conditioning.")
+            if str(warp_history_downsample_mode or "short") != "short":
+                raise ValueError("warp_history_downsample_mode is only supported for Warp-as-History conditioning.")
             return self._run_original_helios(
                 prompt=prompt,
                 image=image,
@@ -2039,6 +2083,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             conditioning_type="camera" if using_camera_warp else "warp",
             lora_path=lora_path,
             visible_token_drop=bool(visible_token_drop),
+            warp_history_downsample_mode=str(warp_history_downsample_mode),
             rope_alignment=bool(rope_alignment),
             warp_invisible_fill=str(warp_invisible_fill),
             height=int(height),
@@ -2056,6 +2101,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             warp_noise_sigma_min=float(warp_noise_sigma_min),
             warp_noise_sigma_max=float(warp_noise_sigma_max),
             is_amplify_first_chunk=bool(is_amplify_first_chunk),
+            pyramid_num_inference_steps_list=pyramid_num_inference_steps_list,
             lora_prompt_trigger=lora_prompt_trigger,
             prev_chunk_history_sizes=prev_chunk_history_sizes,
             camera_control_translation_scale=float(camera_control_translation_scale),
