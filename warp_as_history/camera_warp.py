@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import math
+import json
+import os
 import sys
+import time
+from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +19,39 @@ try:
     import cv2
 except Exception:  # pragma: no cover - only needed when top-fill is used.
     cv2 = None
+
+
+def _camera_profile_enabled() -> bool:
+    return os.environ.get("WAH_PROFILE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _camera_sync_cuda() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _camera_profile_event(event: str, start: float, **payload: Any) -> None:
+    if not _camera_profile_enabled():
+        return
+    _camera_sync_cuda()
+    print(json.dumps({"event": event, "seconds": round(time.perf_counter() - start, 6), **payload}), flush=True)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except ValueError:
+        return int(default)
 
 
 CAMERA_CONTROL_PROMPT_TRIGGER = "camctl23x."
@@ -42,6 +79,14 @@ CAMERA_CONTROL_DEFAULT_MESH_DEPTH_RTOL = 0.03
 CAMERA_CONTROL_DEFAULT_MESH_NORMAL_TOL_DEG = 5.0
 CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY = True
 CAMERA_CONTROL_PI3X_KEYFRAME_PREVIOUS_MESH_SAMPLES_PER_AXIS = 1
+CAMERA_CONTROL_PI3X_KEYFRAME_RENDER_MAX_PREVIOUS = 1
+CAMERA_CONTROL_PI3X_KEYFRAME_VISIBILITY_STRIDE = 8
+CAMERA_CONTROL_PI3X_KEYFRAME_VIEW_CULL_MARGIN = 8
+CAMERA_CONTROL_PI3X_KEYFRAME_SAMPLE_POINT_CULL = _env_bool("WAH_CAMERA_SAMPLE_POINT_CULL", False)
+CAMERA_CONTROL_PI3X_KEYFRAME_SAMPLE_POINT_CULL_FRAME_STRIDE = max(
+    _env_int("WAH_CAMERA_SAMPLE_POINT_CULL_FRAME_STRIDE", 4),
+    1,
+)
 CAMERA_CONTROL_KEYFRAME_BACKGROUND_ATLAS_HEIGHT = 384
 CAMERA_CONTROL_KEYFRAME_BACKGROUND_ATLAS_WIDTH = 768
 CAMERA_CONTROL_KEYFRAME_BACKGROUND_DEPTH_QUANTILE = 0.65
@@ -372,16 +417,33 @@ def _depth_scale_to_reference(
     return applied_scale, stats
 
 
-def _world_rays_from_intrinsic(height: int, width: int, intrinsic: np.ndarray, pose: np.ndarray) -> np.ndarray:
-    intrinsic = np.asarray(intrinsic, dtype=np.float32)
-    pose = np.asarray(pose, dtype=np.float32)
+@lru_cache(maxsize=32)
+def _camera_rays_from_intrinsic_cached(
+    height: int,
+    width: int,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+) -> np.ndarray:
     ys, xs = np.mgrid[0:int(height), 0:int(width)].astype(np.float32)
-    fx = max(abs(float(intrinsic[0, 0])), 1e-6)
-    fy = max(abs(float(intrinsic[1, 1])), 1e-6)
-    cx = float(intrinsic[0, 2])
-    cy = float(intrinsic[1, 2])
     dirs_cam = np.stack(((xs - cx) / fx, (ys - cy) / fy, np.ones_like(xs)), axis=-1)
     dirs_cam /= np.linalg.norm(dirs_cam, axis=-1, keepdims=True).clip(min=1e-6)
+    return dirs_cam.astype(np.float32, copy=False)
+
+
+def _camera_rays_from_intrinsic(height: int, width: int, intrinsic: np.ndarray) -> np.ndarray:
+    intrinsic = np.asarray(intrinsic, dtype=np.float32)
+    fx = round(max(abs(float(intrinsic[0, 0])), 1e-6), 4)
+    fy = round(max(abs(float(intrinsic[1, 1])), 1e-6), 4)
+    cx = round(float(intrinsic[0, 2]), 4)
+    cy = round(float(intrinsic[1, 2]), 4)
+    return _camera_rays_from_intrinsic_cached(int(height), int(width), fx, fy, cx, cy)
+
+
+def _world_rays_from_intrinsic(height: int, width: int, intrinsic: np.ndarray, pose: np.ndarray) -> np.ndarray:
+    pose = np.asarray(pose, dtype=np.float32)
+    dirs_cam = _camera_rays_from_intrinsic(height, width, intrinsic)
     dirs_world = dirs_cam @ pose[:3, :3].T
     dirs_world /= np.linalg.norm(dirs_world, axis=-1, keepdims=True).clip(min=1e-6)
     return dirs_world.astype(np.float32, copy=False)
@@ -457,16 +519,40 @@ def _fill_atlas_rows_nearest(atlas_rgb: np.ndarray, valid_mask: np.ndarray) -> t
     return filled, filled_valid
 
 
-def _build_keyframe_background_atlas(keyframe_geometries: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _fill_atlas_rows_nearest_torch(atlas_rgb: torch.Tensor, valid_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    filled = atlas_rgb.clone()
+    filled_valid = valid_mask.to(dtype=torch.bool).clone()
+    fill_radius = int(CAMERA_CONTROL_KEYFRAME_BACKGROUND_ATLAS_FILL_RADIUS)
+    for dist in range(0, fill_radius + 1):
+        shifts = (0,) if dist == 0 else (-dist, dist)
+        for source_offset in shifts:
+            need_fill = ~filled_valid
+            candidate_valid = torch.roll(valid_mask, shifts=-source_offset, dims=1)
+            fill_mask = need_fill & candidate_valid
+            candidate_rgb = torch.roll(atlas_rgb, shifts=-source_offset, dims=1)
+            filled = torch.where(fill_mask[..., None], candidate_rgb, filled)
+            filled_valid = filled_valid | fill_mask
+    return filled, filled_valid
+
+
+def _build_keyframe_background_atlas(
+    keyframe_geometries: list[dict[str, Any]],
+    *,
+    chunk_index: int | None = None,
+) -> dict[str, Any] | None:
     atlas_height = int(CAMERA_CONTROL_KEYFRAME_BACKGROUND_ATLAS_HEIGHT)
     atlas_width = int(CAMERA_CONTROL_KEYFRAME_BACKGROUND_ATLAS_WIDTH)
     sum_rgb = np.zeros((atlas_height, atlas_width, 3), dtype=np.float32)
     count = np.zeros((atlas_height, atlas_width), dtype=np.float32)
     records: list[dict[str, Any]] = []
+    profile_ray_uv_seconds = 0.0
+    profile_mask_seconds = 0.0
+    profile_scatter_seconds = 0.0
 
     for keyframe_index, keyframe_geometry in enumerate(keyframe_geometries):
         rgb = np.asarray(keyframe_geometry["source_rgb_u8"], dtype=np.uint8)
         height, width = rgb.shape[:2]
+        profile_part_start = time.perf_counter()
         rays_world = _world_rays_from_intrinsic(
             height,
             width,
@@ -478,7 +564,11 @@ def _build_keyframe_background_atlas(keyframe_geometries: list[dict[str, Any]]) 
             atlas_height=atlas_height,
             atlas_width=atlas_width,
         )
+        profile_ray_uv_seconds += time.perf_counter() - profile_part_start
+        profile_part_start = time.perf_counter()
         background_mask = _keyframe_background_mask(keyframe_geometry)
+        profile_mask_seconds += time.perf_counter() - profile_part_start
+        profile_part_start = time.perf_counter()
         flat_mask = background_mask.reshape(-1)
         flat_u = u.reshape(-1)[flat_mask]
         flat_v = v.reshape(-1)[flat_mask]
@@ -486,6 +576,7 @@ def _build_keyframe_background_atlas(keyframe_geometries: list[dict[str, Any]]) 
         if flat_rgb.size:
             np.add.at(sum_rgb, (flat_v, flat_u), flat_rgb)
             np.add.at(count, (flat_v, flat_u), 1.0)
+        profile_scatter_seconds += time.perf_counter() - profile_part_start
         records.append(
             {
                 "background_pixels": int(flat_mask.sum()),
@@ -499,9 +590,29 @@ def _build_keyframe_background_atlas(keyframe_geometries: list[dict[str, Any]]) 
     if not bool(valid.any()):
         return None
 
+    profile_part_start = time.perf_counter()
     atlas = np.zeros_like(sum_rgb, dtype=np.uint8)
     atlas[valid] = np.clip(np.rint(sum_rgb[valid] / count[valid, None]), 0, 255).astype(np.uint8)
+    profile_finalize_seconds = time.perf_counter() - profile_part_start
+    profile_part_start = time.perf_counter()
     sample_atlas, sample_valid = _fill_atlas_rows_nearest(atlas, valid)
+    profile_fill_seconds = time.perf_counter() - profile_part_start
+    if _camera_profile_enabled():
+        print(
+            json.dumps(
+                {
+                    "event": "profile_camera_render_background_atlas_build_breakdown",
+                    "chunk_index": chunk_index,
+                    "fill_seconds": round(profile_fill_seconds, 6),
+                    "finalize_seconds": round(profile_finalize_seconds, 6),
+                    "keyframes": int(len(keyframe_geometries)),
+                    "mask_seconds": round(profile_mask_seconds, 6),
+                    "ray_uv_seconds": round(profile_ray_uv_seconds, 6),
+                    "scatter_seconds": round(profile_scatter_seconds, 6),
+                }
+            ),
+            flush=True,
+        )
     return {
         "atlas": sample_atlas,
         "stats": {
@@ -514,6 +625,124 @@ def _build_keyframe_background_atlas(keyframe_geometries: list[dict[str, Any]]) 
             "sample_texel_fraction": float(sample_valid.sum() / max(sample_valid.size, 1)),
         },
         "valid": sample_valid,
+    }
+
+
+def _build_keyframe_background_atlas_torch(
+    keyframe_geometries: list[dict[str, Any]],
+    *,
+    device: torch.device,
+    chunk_index: int | None = None,
+) -> dict[str, Any] | None:
+    atlas_height = int(CAMERA_CONTROL_KEYFRAME_BACKGROUND_ATLAS_HEIGHT)
+    atlas_width = int(CAMERA_CONTROL_KEYFRAME_BACKGROUND_ATLAS_WIDTH)
+    sum_rgb = torch.zeros((atlas_height * atlas_width, 3), device=device, dtype=torch.float32)
+    count = torch.zeros((atlas_height * atlas_width,), device=device, dtype=torch.float32)
+    records: list[dict[str, Any]] = []
+    profile_ray_uv_seconds = 0.0
+    profile_mask_seconds = 0.0
+    profile_scatter_seconds = 0.0
+    profile_enabled = _camera_profile_enabled()
+
+    for keyframe_index, keyframe_geometry in enumerate(keyframe_geometries):
+        rgb_np = np.asarray(keyframe_geometry["source_rgb_u8"], dtype=np.uint8)
+        height, width = rgb_np.shape[:2]
+        profile_part_start = time.perf_counter()
+        dirs_cam_np = _camera_rays_from_intrinsic(height, width, keyframe_geometry["intrinsic"]).reshape(-1, 3)
+        dirs_cam = torch.from_numpy(dirs_cam_np).to(device=device, dtype=torch.float32)
+        pose = torch.as_tensor(
+            np.asarray(keyframe_geometry["source_pose"], dtype=np.float32),
+            device=device,
+            dtype=torch.float32,
+        )
+        dirs_world = dirs_cam @ pose[:3, :3].T
+        dirs_world = F.normalize(dirs_world, dim=-1, eps=1.0e-6)
+        u, v = _spherical_uv_from_world_rays_torch(
+            dirs_world.reshape(height, width, 3),
+            atlas_height=atlas_height,
+            atlas_width=atlas_width,
+        )
+        if profile_enabled:
+            _camera_sync_cuda()
+        profile_ray_uv_seconds += time.perf_counter() - profile_part_start
+
+        profile_part_start = time.perf_counter()
+        background_mask_np = _keyframe_background_mask(keyframe_geometry)
+        background_mask = torch.from_numpy(background_mask_np).to(device=device, dtype=torch.bool)
+        if profile_enabled:
+            _camera_sync_cuda()
+        profile_mask_seconds += time.perf_counter() - profile_part_start
+
+        profile_part_start = time.perf_counter()
+        flat_mask = background_mask.reshape(-1)
+        flat_idx = (v.reshape(-1)[flat_mask] * atlas_width + u.reshape(-1)[flat_mask]).to(dtype=torch.long)
+        flat_rgb = torch.from_numpy(rgb_np.reshape(-1, 3)).to(device=device, dtype=torch.float32)[flat_mask]
+        if int(flat_rgb.numel()) > 0:
+            sum_rgb.scatter_add_(0, flat_idx[:, None].expand(-1, 3), flat_rgb)
+            count.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float32))
+        background_pixels = int(background_mask_np.sum())
+        if profile_enabled:
+            _camera_sync_cuda()
+        profile_scatter_seconds += time.perf_counter() - profile_part_start
+        records.append(
+            {
+                "background_pixels": background_pixels,
+                "height": int(height),
+                "keyframe_index": int(keyframe_index),
+                "width": int(width),
+            }
+        )
+
+    valid = count > 0.0
+    if not bool(valid.any().detach().cpu().item()):
+        return None
+
+    profile_part_start = time.perf_counter()
+    atlas = torch.zeros_like(sum_rgb, dtype=torch.float32)
+    atlas[valid] = torch.clamp(torch.round(sum_rgb[valid] / count[valid, None]), 0.0, 255.0) / 255.0
+    atlas = atlas.view(atlas_height, atlas_width, 3)
+    valid_2d = valid.view(atlas_height, atlas_width)
+    if profile_enabled:
+        _camera_sync_cuda()
+    profile_finalize_seconds = time.perf_counter() - profile_part_start
+
+    profile_part_start = time.perf_counter()
+    sample_atlas, sample_valid = _fill_atlas_rows_nearest_torch(atlas, valid_2d)
+    if profile_enabled:
+        _camera_sync_cuda()
+    profile_fill_seconds = time.perf_counter() - profile_part_start
+
+    raw_texels = int(valid.sum().detach().cpu().item())
+    filled_texels = int(sample_valid.sum().detach().cpu().item())
+    if _camera_profile_enabled():
+        print(
+            json.dumps(
+                {
+                    "backend": "torch",
+                    "event": "profile_camera_render_background_atlas_build_breakdown",
+                    "chunk_index": chunk_index,
+                    "fill_seconds": round(profile_fill_seconds, 6),
+                    "finalize_seconds": round(profile_finalize_seconds, 6),
+                    "keyframes": int(len(keyframe_geometries)),
+                    "mask_seconds": round(profile_mask_seconds, 6),
+                    "ray_uv_seconds": round(profile_ray_uv_seconds, 6),
+                    "scatter_seconds": round(profile_scatter_seconds, 6),
+                }
+            ),
+            flush=True,
+        )
+    return {
+        "atlas_torch": sample_atlas.contiguous(),
+        "stats": {
+            "atlas_height": atlas_height,
+            "atlas_width": atlas_width,
+            "filled_texels": filled_texels,
+            "keyframes": records,
+            "raw_texels": raw_texels,
+            "raw_texel_fraction": float(raw_texels / max(atlas_height * atlas_width, 1)),
+            "sample_texel_fraction": float(filled_texels / max(atlas_height * atlas_width, 1)),
+        },
+        "valid_torch": sample_valid.contiguous(),
     }
 
 
@@ -533,6 +762,130 @@ def _render_background_atlas(
     frame_valid = valid[v, u].copy()
     frame[~frame_valid] = np.asarray(fill_rgb, dtype=np.uint8)
     return frame, frame_valid
+
+
+def _render_background_atlas_batch(
+    background_atlas: dict[str, Any],
+    target_poses: np.ndarray,
+    intrinsics: np.ndarray,
+    height: int,
+    width: int,
+    fill_rgb: np.ndarray,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    target_poses = np.asarray(target_poses, dtype=np.float32)
+    intrinsics = np.asarray(intrinsics, dtype=np.float32)
+    if target_poses.shape[0] == 0:
+        return [], []
+    if not np.allclose(intrinsics, intrinsics[0], rtol=1e-5, atol=1e-4):
+        frames: list[np.ndarray] = []
+        valids: list[np.ndarray] = []
+        for frame_idx in range(target_poses.shape[0]):
+            frame, valid = _render_background_atlas(
+                background_atlas,
+                target_poses[frame_idx],
+                intrinsics[frame_idx],
+                height,
+                width,
+                fill_rgb,
+            )
+            frames.append(frame)
+            valids.append(valid)
+        return frames, valids
+
+    atlas = np.asarray(background_atlas["atlas"], dtype=np.uint8)
+    valid = np.asarray(background_atlas["valid"], dtype=bool)
+    dirs_cam = _camera_rays_from_intrinsic(height, width, intrinsics[0]).reshape(-1, 3)
+    rotations = target_poses[:, :3, :3]
+    dirs_world = np.einsum("nc,tjc->tnj", dirs_cam, rotations, optimize=True)
+    dirs_world /= np.linalg.norm(dirs_world, axis=-1, keepdims=True).clip(min=1e-6)
+    u, v = _spherical_uv_from_world_rays(
+        dirs_world.reshape(target_poses.shape[0], height, width, 3),
+        atlas_height=atlas.shape[0],
+        atlas_width=atlas.shape[1],
+    )
+    frames = atlas[v, u].copy()
+    frame_valid = valid[v, u].copy()
+    frames[~frame_valid] = np.asarray(fill_rgb, dtype=np.uint8)
+    return [frames[idx] for idx in range(frames.shape[0])], [frame_valid[idx] for idx in range(frame_valid.shape[0])]
+
+
+def _spherical_uv_from_world_rays_torch(
+    rays_world: torch.Tensor,
+    *,
+    atlas_height: int,
+    atlas_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = rays_world[..., 0]
+    y = rays_world[..., 1]
+    z = rays_world[..., 2]
+    yaw = torch.atan2(x, z)
+    pitch = torch.atan2(y, torch.sqrt(torch.clamp(x * x + z * z, min=1.0e-12)))
+    u = torch.floor((yaw + math.pi) * (float(atlas_width) / (2.0 * math.pi))).to(dtype=torch.long)
+    u = torch.remainder(u, int(atlas_width))
+    v = torch.floor((pitch + math.pi * 0.5) * (float(atlas_height) / math.pi)).to(dtype=torch.long)
+    v = torch.clamp(v, 0, int(atlas_height) - 1)
+    return u, v
+
+
+def _render_background_atlas_torch(
+    background_atlas: dict[str, Any],
+    target_poses: torch.Tensor,
+    intrinsics: torch.Tensor,
+    height: int,
+    width: int,
+    fill_rgb01: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = target_poses.device
+    target_poses = target_poses.to(device=device, dtype=torch.float32)
+    intrinsics = intrinsics.to(device=device, dtype=torch.float32)
+    if "atlas_torch" in background_atlas and "valid_torch" in background_atlas:
+        atlas = background_atlas["atlas_torch"].to(device=device, dtype=torch.float32)
+        valid = background_atlas["valid_torch"].to(device=device, dtype=torch.bool)
+    else:
+        atlas = torch.from_numpy(np.asarray(background_atlas["atlas"], dtype=np.uint8)).to(
+            device=device,
+            dtype=torch.float32,
+        ) / 255.0
+        valid = torch.from_numpy(np.asarray(background_atlas["valid"], dtype=bool)).to(device=device, dtype=torch.bool)
+    atlas_height = int(atlas.shape[0])
+    atlas_width = int(atlas.shape[1])
+
+    if target_poses.shape[0] == 0:
+        return (
+            torch.empty((0, int(height), int(width), 3), device=device, dtype=torch.float32),
+            torch.empty((0, int(height), int(width)), device=device, dtype=torch.bool),
+        )
+
+    if not torch.allclose(intrinsics, intrinsics[:1].expand_as(intrinsics), rtol=1.0e-5, atol=1.0e-4):
+        frames = []
+        valids = []
+        for frame_idx in range(int(target_poses.shape[0])):
+            frame, frame_valid = _render_background_atlas_torch(
+                background_atlas,
+                target_poses[frame_idx : frame_idx + 1],
+                intrinsics[frame_idx : frame_idx + 1],
+                height,
+                width,
+                fill_rgb01,
+            )
+            frames.append(frame[0])
+            valids.append(frame_valid[0])
+        return torch.stack(frames, dim=0), torch.stack(valids, dim=0)
+
+    dirs_cam_np = _camera_rays_from_intrinsic(height, width, intrinsics[0].detach().cpu().numpy()).reshape(-1, 3)
+    dirs_cam = torch.from_numpy(dirs_cam_np).to(device=device, dtype=torch.float32)
+    rotations = target_poses[:, :3, :3]
+    dirs_world = torch.einsum("nc,tjc->tnj", dirs_cam, rotations)
+    dirs_world = F.normalize(dirs_world, dim=-1, eps=1.0e-6)
+    u, v = _spherical_uv_from_world_rays_torch(
+        dirs_world.reshape(target_poses.shape[0], int(height), int(width), 3),
+        atlas_height=atlas_height,
+        atlas_width=atlas_width,
+    )
+    frames = atlas[v, u]
+    frame_valid = valid[v, u]
+    frames = torch.where(frame_valid[..., None], frames, fill_rgb01.view(1, 1, 1, 3))
+    return frames.contiguous(), frame_valid.contiguous()
 
 
 def _camera_to_world(points_cam: np.ndarray, source_c2w: np.ndarray) -> np.ndarray:
@@ -929,6 +1282,97 @@ def _depth_normal_break_mask_np(
     }
 
 
+def _depth_normal_break_mask_torch(
+    *,
+    point_map_world: torch.Tensor,
+    depth_map: torch.Tensor,
+    valid_mask: torch.Tensor,
+    depth_rtol: float,
+    normal_tol_deg: float,
+) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    points = point_map_world.detach().float()
+    depth = depth_map.detach().float()
+    valid = valid_mask.detach().bool() & torch.isfinite(points).all(dim=-1) & torch.isfinite(depth) & (depth > 0)
+    if points.ndim == 3:
+        points = points.unsqueeze(0)
+        depth = depth.unsqueeze(0)
+        valid = valid.unsqueeze(0)
+
+    depth_in = depth[:, None]
+    valid_in = valid[:, None]
+    neg_inf = torch.tensor(float("-inf"), device=depth.device, dtype=depth.dtype)
+    max_valid = F.max_pool2d(torch.where(valid_in, depth_in, neg_inf), kernel_size=3, stride=1, padding=1)[:, 0]
+    min_valid = -F.max_pool2d(torch.where(valid_in, -depth_in, neg_inf), kernel_size=3, stride=1, padding=1)[:, 0]
+    depth_edge = ((max_valid - min_valid) / depth.clamp_min(1.0e-6) > float(depth_rtol)) & valid
+
+    points_pad = F.pad(points.permute(0, 3, 1, 2), (1, 1, 1, 1), mode="constant", value=0.0).permute(0, 2, 3, 1)
+    valid_pad = F.pad(valid[:, None].float(), (1, 1, 1, 1), mode="constant", value=0.0)[:, 0].bool()
+    center = points_pad[:, 1:-1, 1:-1]
+    up = points_pad[:, :-2, 1:-1] - center
+    left = points_pad[:, 1:-1, :-2] - center
+    down = points_pad[:, 2:, 1:-1] - center
+    right = points_pad[:, 1:-1, 2:] - center
+
+    normals = torch.stack(
+        [
+            torch.cross(up, left, dim=-1),
+            torch.cross(left, down, dim=-1),
+            torch.cross(down, right, dim=-1),
+            torch.cross(right, up, dim=-1),
+        ],
+        dim=0,
+    )
+    normals = F.normalize(normals, dim=-1, eps=1.0e-12)
+    normal_valid = (
+        torch.stack(
+            [
+                valid_pad[:, :-2, 1:-1] & valid_pad[:, 1:-1, :-2],
+                valid_pad[:, 1:-1, :-2] & valid_pad[:, 2:, 1:-1],
+                valid_pad[:, 2:, 1:-1] & valid_pad[:, 1:-1, 2:],
+                valid_pad[:, 1:-1, 2:] & valid_pad[:, :-2, 1:-1],
+            ],
+            dim=0,
+        )
+        & valid[None]
+    )
+    normal = torch.where(normal_valid[..., None], normals, torch.zeros_like(normals)).sum(dim=0)
+    normal = F.normalize(normal, dim=-1, eps=1.0e-12)
+    normal_mask = normal_valid.any(dim=0)
+    normal = torch.where(normal_mask[..., None], normal, torch.zeros_like(normal))
+
+    normal_pad = F.pad(normal.permute(0, 3, 1, 2), (1, 1, 1, 1), mode="replicate").permute(0, 2, 3, 1)
+    normal_mask_pad = F.pad(normal_mask[:, None].float(), (1, 1, 1, 1), mode="replicate")[:, 0].bool()
+    cos_threshold = math.cos(math.radians(float(normal_tol_deg)))
+    normal_edge = torch.zeros_like(normal_mask, dtype=torch.bool)
+    center_normal = normal
+    for dy in range(3):
+        for dx in range(3):
+            neighbor = normal_pad[:, dy : dy + normal.shape[1], dx : dx + normal.shape[2]]
+            neighbor_valid = normal_mask_pad[:, dy : dy + normal.shape[1], dx : dx + normal.shape[2]]
+            dot = (center_normal * neighbor).sum(dim=-1).clamp(-1.0, 1.0)
+            normal_edge |= normal_mask & neighbor_valid & (dot < cos_threshold)
+    normal_edge = F.max_pool2d(normal_edge[:, None].float(), kernel_size=3, stride=1, padding=1)[:, 0].bool() & normal_mask
+
+    break_mask = depth_edge & normal_edge
+    stats: list[dict[str, Any]] = []
+    for idx in range(valid.shape[0]):
+        valid_count = int(valid[idx].sum().detach().cpu().item())
+        break_count = int(break_mask[idx].sum().detach().cpu().item())
+        stats.append(
+            {
+                "depth_rtol": float(depth_rtol),
+                "normal_tol_deg": float(normal_tol_deg),
+                "valid_pixels": valid_count,
+                "depth_edge_pixels": int(depth_edge[idx].sum().detach().cpu().item()),
+                "normal_edge_pixels": int(normal_edge[idx].sum().detach().cpu().item()),
+                "break_pixels": break_count,
+                "break_fraction_of_valid": float(break_count / max(valid_count, 1)),
+                "backend": "torch",
+            }
+        )
+    return break_mask, stats
+
+
 def _apply_mesh_break(
     *,
     point_map_world: np.ndarray,
@@ -1088,6 +1532,219 @@ def _splat_mesh_samples_to_view_torch(
     return frame.view(height, width, 3), visible.view(height, width)
 
 
+def _project_points_visible_mask_np(
+    points_world: np.ndarray,
+    target_poses_world: np.ndarray,
+    render_intrinsics: np.ndarray,
+    height: int,
+    width: int,
+    *,
+    margin: int = 0,
+    z_eps: float = 1.0e-4,
+) -> np.ndarray:
+    points = np.asarray(points_world, dtype=np.float32)
+    if points.size == 0:
+        return np.zeros((0,), dtype=bool)
+    finite = np.isfinite(points).all(axis=1)
+    keep = np.zeros((points.shape[0],), dtype=bool)
+    if not bool(finite.any()):
+        return keep
+    valid_indices = np.flatnonzero(finite)
+    valid_points = points[valid_indices]
+    target_poses = np.asarray(target_poses_world, dtype=np.float32)
+    intrinsics = np.asarray(render_intrinsics, dtype=np.float32)
+    margin_f = float(max(int(margin), 0))
+    width_max = float(int(width) - 1 + margin_f)
+    height_max = float(int(height) - 1 + margin_f)
+    for frame_idx in range(target_poses.shape[0]):
+        w2c = se3_inverse(target_poses[frame_idx].astype(np.float32, copy=False))
+        points_cam = valid_points @ w2c[:3, :3].T + w2c[:3, 3]
+        z = points_cam[:, 2]
+        valid_projection = np.isfinite(points_cam).all(axis=1) & (z > float(z_eps))
+        if not bool(valid_projection.any()):
+            continue
+        intrinsic = intrinsics[frame_idx]
+        u = np.empty_like(z, dtype=np.float32)
+        v = np.empty_like(z, dtype=np.float32)
+        u.fill(np.nan)
+        v.fill(np.nan)
+        projected = points_cam[valid_projection]
+        projected_z = z[valid_projection]
+        u[valid_projection] = intrinsic[0, 0] * (projected[:, 0] / projected_z) + intrinsic[0, 2]
+        v[valid_projection] = intrinsic[1, 1] * (projected[:, 1] / projected_z) + intrinsic[1, 2]
+        visible = valid_projection & (u >= -margin_f) & (u <= width_max) & (v >= -margin_f) & (v <= height_max)
+        if bool(visible.any()):
+            keep[valid_indices[visible]] = True
+    return keep
+
+
+def _score_keyframe_visibility_np(
+    keyframe_geometry: dict[str, Any],
+    target_poses_world: np.ndarray,
+    render_intrinsics: np.ndarray,
+    height: int,
+    width: int,
+    *,
+    stride: int,
+    margin: int,
+) -> dict[str, Any]:
+    point_map = np.asarray(keyframe_geometry["point_map_world"], dtype=np.float32)
+    valid_mask = np.asarray(keyframe_geometry.get("valid_mask", np.isfinite(point_map).all(axis=-1)), dtype=bool)
+    stride = max(int(stride), 1)
+    sampled_points = point_map[::stride, ::stride].reshape(-1, 3)
+    sampled_valid = valid_mask[::stride, ::stride].reshape(-1) & np.isfinite(sampled_points).all(axis=1)
+    sampled_points = sampled_points[sampled_valid]
+    if sampled_points.size == 0:
+        return {
+            "candidate_points": 0,
+            "score": 0.0,
+            "visible_points": 0,
+        }
+    visible = _project_points_visible_mask_np(
+        sampled_points,
+        target_poses_world,
+        render_intrinsics,
+        height,
+        width,
+        margin=margin,
+    )
+    visible_points = int(visible.sum())
+    return {
+        "candidate_points": int(sampled_points.shape[0]),
+        "score": float(visible_points / max(int(sampled_points.shape[0]), 1)),
+        "visible_points": visible_points,
+    }
+
+
+def _select_visible_keyframe_geometries(
+    keyframe_geometries: list[dict[str, Any]],
+    target_poses_world: np.ndarray,
+    render_intrinsics: np.ndarray,
+    height: int,
+    width: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if len(keyframe_geometries) <= 1:
+        return keyframe_geometries, {
+            "enabled": False,
+            "input_keyframes": int(len(keyframe_geometries)),
+            "kept_keyframes": int(len(keyframe_geometries)),
+            "reason": "single_keyframe",
+        }
+
+    latest_index = len(keyframe_geometries) - 1
+    future_poses = np.asarray(target_poses_world, dtype=np.float32)[1:]
+    future_intrinsics = np.asarray(render_intrinsics, dtype=np.float32)[1:]
+    if future_poses.shape[0] == 0:
+        return [keyframe_geometries[-1]], {
+            "enabled": True,
+            "input_keyframes": int(len(keyframe_geometries)),
+            "kept_indices": [int(latest_index)],
+            "kept_keyframes": 1,
+            "reason": "no_future_frames",
+        }
+
+    scores: list[dict[str, Any]] = []
+    for keyframe_index, keyframe_geometry in enumerate(keyframe_geometries[:-1]):
+        score = _score_keyframe_visibility_np(
+            keyframe_geometry,
+            future_poses,
+            future_intrinsics,
+            height,
+            width,
+            stride=CAMERA_CONTROL_PI3X_KEYFRAME_VISIBILITY_STRIDE,
+            margin=CAMERA_CONTROL_PI3X_KEYFRAME_VIEW_CULL_MARGIN,
+        )
+        score["keyframe_index"] = int(keyframe_index)
+        scores.append(score)
+
+    max_previous = max(int(CAMERA_CONTROL_PI3X_KEYFRAME_RENDER_MAX_PREVIOUS), 0)
+    visible_scores = [score for score in scores if int(score["visible_points"]) > 0]
+    visible_scores.sort(key=lambda item: (float(item["score"]), int(item["visible_points"])), reverse=True)
+    kept_previous = sorted(int(item["keyframe_index"]) for item in visible_scores[:max_previous])
+    kept_indices = kept_previous + [latest_index]
+    selected = [keyframe_geometries[index] for index in kept_indices]
+    return selected, {
+        "enabled": True,
+        "input_keyframes": int(len(keyframe_geometries)),
+        "kept_indices": [int(index) for index in kept_indices],
+        "kept_keyframes": int(len(kept_indices)),
+        "max_previous": int(max_previous),
+        "scores": scores,
+        "stride": int(CAMERA_CONTROL_PI3X_KEYFRAME_VISIBILITY_STRIDE),
+        "view_cull_margin": int(CAMERA_CONTROL_PI3X_KEYFRAME_VIEW_CULL_MARGIN),
+    }
+
+
+def _cull_sampled_points_to_future_views(
+    sampled_points_world: np.ndarray,
+    sampled_colors_u8: np.ndarray,
+    sampled_source_xy: np.ndarray,
+    target_poses_world: np.ndarray,
+    render_intrinsics: np.ndarray,
+    height: int,
+    width: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    future_poses = np.asarray(target_poses_world, dtype=np.float32)[1:]
+    future_intrinsics = np.asarray(render_intrinsics, dtype=np.float32)[1:]
+    input_points = int(np.asarray(sampled_points_world).shape[0])
+    if not bool(CAMERA_CONTROL_PI3X_KEYFRAME_SAMPLE_POINT_CULL):
+        return sampled_points_world, sampled_colors_u8, sampled_source_xy, {
+            "enabled": False,
+            "input_points": input_points,
+            "kept_points": input_points,
+            "reason": "disabled_low_reduction_high_cost",
+        }
+    if input_points == 0 or future_poses.shape[0] == 0:
+        return sampled_points_world, sampled_colors_u8, sampled_source_xy, {
+            "enabled": False,
+            "input_points": input_points,
+            "kept_points": input_points,
+            "reason": "empty_or_no_future_frames",
+        }
+    frame_stride = max(int(CAMERA_CONTROL_PI3X_KEYFRAME_SAMPLE_POINT_CULL_FRAME_STRIDE), 1)
+    if frame_stride > 1 and future_poses.shape[0] > 1:
+        indices = np.arange(0, future_poses.shape[0], frame_stride, dtype=np.int64)
+        last_index = np.int64(future_poses.shape[0] - 1)
+        if indices.size == 0 or int(indices[-1]) != int(last_index):
+            indices = np.concatenate([indices, np.asarray([last_index], dtype=np.int64)])
+        future_poses = future_poses[indices]
+        future_intrinsics = future_intrinsics[indices]
+    keep = _project_points_visible_mask_np(
+        sampled_points_world,
+        future_poses,
+        future_intrinsics,
+        height,
+        width,
+        margin=CAMERA_CONTROL_PI3X_KEYFRAME_VIEW_CULL_MARGIN,
+    )
+    kept_points = int(keep.sum())
+    if kept_points <= 0:
+        return sampled_points_world, sampled_colors_u8, sampled_source_xy, {
+            "enabled": True,
+            "fallback": "all_points",
+            "input_points": input_points,
+            "kept_points": input_points,
+            "raw_kept_points": 0,
+            "frame_stride": int(frame_stride),
+            "tested_frames": int(future_poses.shape[0]),
+            "view_cull_margin": int(CAMERA_CONTROL_PI3X_KEYFRAME_VIEW_CULL_MARGIN),
+        }
+    return (
+        np.asarray(sampled_points_world)[keep],
+        np.asarray(sampled_colors_u8)[keep],
+        np.asarray(sampled_source_xy)[keep],
+        {
+            "enabled": True,
+            "input_points": input_points,
+            "kept_fraction": float(kept_points / max(input_points, 1)),
+            "kept_points": kept_points,
+            "frame_stride": int(frame_stride),
+            "tested_frames": int(future_poses.shape[0]),
+            "view_cull_margin": int(CAMERA_CONTROL_PI3X_KEYFRAME_VIEW_CULL_MARGIN),
+        },
+    )
+
+
 def _target_fill_from_source_xy_torch(
     frame01: torch.Tensor,
     visible: torch.Tensor,
@@ -1143,6 +1800,65 @@ def _target_fill_from_source_xy_torch(
     frame01 = torch.where(fill_mask[..., None], sampled, frame01)
     visible_bool = visible_bool | fill_mask
     return frame01, visible_bool, fill_mask
+
+
+def _target_fill_from_source_xy_torch_batch(
+    frames01: torch.Tensor,
+    visible: torch.Tensor,
+    source_xy: torch.Tensor,
+    source_rgb01: torch.Tensor,
+    radius: int,
+    min_neighbors: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    radius = max(0, int(radius))
+    if radius <= 0:
+        fill_mask = torch.zeros_like(visible, dtype=torch.bool)
+        return frames01, visible.to(dtype=torch.bool), fill_mask
+    kernel_size = radius * 2 + 1
+    min_neighbors = max(1, int(min_neighbors))
+    area = float(kernel_size * kernel_size)
+
+    visible_bool = visible.to(dtype=torch.bool)
+    visible_f = visible_bool.to(dtype=torch.float32).unsqueeze(1)
+    neighbor_count = F.avg_pool2d(visible_f, kernel_size, stride=1, padding=radius) * area
+    neighbor_count_2d = neighbor_count[:, 0]
+    fill_mask = (~visible_bool) & (neighbor_count_2d >= float(min_neighbors))
+
+    source_xy_nchw = source_xy.to(dtype=torch.float32).permute(0, 3, 1, 2)
+    source_xy_sum = F.avg_pool2d(source_xy_nchw * visible_f, kernel_size, stride=1, padding=radius) * area
+    source_xy_avg = (source_xy_sum / neighbor_count.clamp_min(1.0)).permute(0, 2, 3, 1)
+
+    src_h, src_w = int(source_rgb01.shape[0]), int(source_rgb01.shape[1])
+    fill_mask = (
+        fill_mask
+        & torch.isfinite(source_xy_avg).all(dim=-1)
+        & (source_xy_avg[..., 0] >= 0.0)
+        & (source_xy_avg[..., 0] <= float(max(src_w - 1, 0)))
+        & (source_xy_avg[..., 1] >= 0.0)
+        & (source_xy_avg[..., 1] <= float(max(src_h - 1, 0)))
+    )
+
+    if src_w > 1:
+        grid_x = source_xy_avg[..., 0] / float(src_w - 1) * 2.0 - 1.0
+    else:
+        grid_x = torch.zeros_like(source_xy_avg[..., 0])
+    if src_h > 1:
+        grid_y = source_xy_avg[..., 1] / float(src_h - 1) * 2.0 - 1.0
+    else:
+        grid_y = torch.zeros_like(source_xy_avg[..., 1])
+    grid = torch.stack([grid_x, grid_y], dim=-1)
+    source_rgb_nchw = source_rgb01.to(dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+    source_rgb_nchw = source_rgb_nchw.expand(int(frames01.shape[0]), -1, -1, -1)
+    sampled = F.grid_sample(
+        source_rgb_nchw,
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    ).permute(0, 2, 3, 1)
+    frames01 = torch.where(fill_mask[..., None], sampled, frames01)
+    visible_bool = visible_bool | fill_mask
+    return frames01, visible_bool, fill_mask
 
 
 def _target_fill_from_source_xy_numpy(
@@ -1313,6 +2029,7 @@ class Pi3XWarpRenderer:
                 255,
             ).astype(np.uint8),
             "valid_mask": valid_mask,
+            "valid_mask_prefiltered_depth_normal": True,
         }
         return self.ensure_valid_depth_geometry(geometry, reason="pi3x_runtime")
 
@@ -1321,7 +2038,9 @@ class Pi3XWarpRenderer:
         image_tensors: list[torch.Tensor],
         device: torch.device | None = None,
         scale_reference_geometry: dict[str, Any] | None = None,
+        chunk_index: int | None = None,
     ) -> dict[str, Any]:
+        profile_total_start = time.perf_counter()
         keyframe_tensors: list[torch.Tensor] = []
         for image_tensor in image_tensors:
             if image_tensor is None:
@@ -1338,15 +2057,23 @@ class Pi3XWarpRenderer:
             raise ValueError("Pi3X keyframe geometry requires at least one keyframe image.")
 
         device = torch.device(device or keyframe_tensors[-1].device)
+        profile_start = time.perf_counter()
         keyframe_tensors = [tensor.to(device=device, dtype=torch.float32) for tensor in keyframe_tensors]
         runtime = self._get_pi3x_runtime(device)
         model = runtime["model"]
         recover_intrinsic_from_rays_d = runtime["recover_intrinsic_from_rays_d"]
+        _camera_profile_event(
+            "profile_camera_keyframe_geometry_prepare",
+            profile_start,
+            chunk_index=chunk_index,
+            keyframes=len(keyframe_tensors),
+        )
 
         src_height = int(keyframe_tensors[-1].shape[-2])
         src_width = int(keyframe_tensors[-1].shape[-1])
         render_height, render_width = _pi3_target_size(src_width, src_height, int(self.config.pi3_pixel_limit))
 
+        profile_start = time.perf_counter()
         pi3_frame_batch = []
         for keyframe_tensor in keyframe_tensors:
             frame01 = ((keyframe_tensor + 1.0) * 0.5).clamp(0.0, 1.0)
@@ -1359,8 +2086,17 @@ class Pi3XWarpRenderer:
             pi3_frame_batch.append(frame01[0])
         pi3_imgs = torch.stack(pi3_frame_batch, dim=0).unsqueeze(0)
         num_keyframes = int(pi3_imgs.shape[1])
+        _camera_profile_event(
+            "profile_camera_keyframe_geometry_resize",
+            profile_start,
+            chunk_index=chunk_index,
+            keyframes=num_keyframes,
+            render_height=render_height,
+            render_width=render_width,
+        )
 
         _force_pi3x_float_heads(model)
+        profile_start = time.perf_counter()
         with torch.no_grad(), _autocast_context(device):
             res = model(
                 imgs=pi3_imgs,
@@ -1370,7 +2106,14 @@ class Pi3XWarpRenderer:
                 poses=None,
                 with_prior=True,
             )
+        _camera_profile_event(
+            "profile_camera_keyframe_geometry_pi3_forward",
+            profile_start,
+            chunk_index=chunk_index,
+            keyframes=num_keyframes,
+        )
 
+        profile_start = time.perf_counter()
         rays_d = F.normalize(res["local_points"][0].detach(), dim=-1)
         intrinsics = recover_intrinsic_from_rays_d(rays_d, force_center_principal_point=True)
         recovered_intrinsics_np = _normalize_intrinsics_shape(intrinsics, num_keyframes).numpy()
@@ -1394,23 +2137,36 @@ class Pi3XWarpRenderer:
         point_maps_world = res["points"][0].detach().float().cpu().numpy()
         source_poses = res["camera_poses"][0].detach().float().cpu().numpy()
         valid_masks = valid[0].detach().cpu().numpy()
-        edge_filter_stats = []
+        _camera_profile_event(
+            "profile_camera_keyframe_geometry_cpu_transfer",
+            profile_start,
+            chunk_index=chunk_index,
+            keyframes=num_keyframes,
+        )
+        profile_start = time.perf_counter()
+        break_masks_t, edge_filter_stats = _depth_normal_break_mask_torch(
+            point_map_world=res["points"][0],
+            depth_map=res["local_points"][0, ..., 2],
+            valid_mask=valid[0],
+            depth_rtol=float(self.config.depth_edge_rtol),
+            normal_tol_deg=float(self.config.mesh_normal_tol_deg),
+        )
+        break_masks = break_masks_t.detach().cpu().numpy()
         for keyframe_index in range(num_keyframes):
-            break_mask, stats = _depth_normal_break_mask_np(
-                point_map_world=point_maps_world[keyframe_index],
-                depth_map=depth_maps[keyframe_index],
-                valid_mask=valid_masks[keyframe_index],
-                depth_rtol=float(self.config.depth_edge_rtol),
-                normal_tol_deg=float(self.config.mesh_normal_tol_deg),
-            )
-            valid_masks[keyframe_index] = valid_masks[keyframe_index] & ~break_mask
-            stats["keyframe_index"] = int(keyframe_index)
-            edge_filter_stats.append(stats)
+            valid_masks[keyframe_index] = valid_masks[keyframe_index] & ~break_masks[keyframe_index]
+            edge_filter_stats[keyframe_index]["keyframe_index"] = int(keyframe_index)
+        _camera_profile_event(
+            "profile_camera_keyframe_geometry_edge_filter",
+            profile_start,
+            chunk_index=chunk_index,
+            keyframes=num_keyframes,
+        )
         scale_alignment_stats: dict[str, Any] = {
             "applied_scale": 1.0,
             "policy": "none",
             "status": "disabled",
         }
+        profile_start = time.perf_counter()
         if scale_reference_geometry is not None:
             reference_valid = scale_reference_geometry.get("valid_mask")
             scale, scale_alignment_stats = _depth_scale_to_reference(
@@ -1425,13 +2181,27 @@ class Pi3XWarpRenderer:
             point_maps_world = point_maps_world * float(scale)
             source_poses = source_poses.copy()
             source_poses[:, :3, 3] *= float(scale)
+        _camera_profile_event(
+            "profile_camera_keyframe_geometry_scale_align",
+            profile_start,
+            chunk_index=chunk_index,
+            keyframes=num_keyframes,
+        )
 
+        profile_start = time.perf_counter()
         source_rgb_u8 = np.clip(
             pi3_imgs[0].detach().float().cpu().permute(0, 2, 3, 1).numpy() * 255.0 + 0.5,
             0,
             255,
         ).astype(np.uint8)
+        _camera_profile_event(
+            "profile_camera_keyframe_geometry_source_rgb_transfer",
+            profile_start,
+            chunk_index=chunk_index,
+            keyframes=num_keyframes,
+        )
 
+        profile_start = time.perf_counter()
         keyframe_geometries = []
         for keyframe_index in range(num_keyframes):
             keyframe_geometry = {
@@ -1451,13 +2221,20 @@ class Pi3XWarpRenderer:
                 "source_pose": source_poses[keyframe_index],
                 "source_rgb_u8": source_rgb_u8[keyframe_index],
                 "valid_mask": valid_masks[keyframe_index],
+                "valid_mask_prefiltered_depth_normal": True,
             }
             keyframe_geometries.append(
                 self.ensure_valid_depth_geometry(keyframe_geometry, reason=f"pi3x_keyframe_{keyframe_index}")
             )
+        _camera_profile_event(
+            "profile_camera_keyframe_geometry_pack",
+            profile_start,
+            chunk_index=chunk_index,
+            keyframes=num_keyframes,
+        )
 
         latest_geometry = keyframe_geometries[-1]
-        return {
+        result = {
             "geometry_backend": "pi3x_keyframes",
             "intrinsic": latest_geometry["intrinsic"],
             "intrinsic_smoothing_stats": intrinsic_smoothing_stats,
@@ -1473,6 +2250,13 @@ class Pi3XWarpRenderer:
             "source_pose": latest_geometry["source_pose"],
             "source_rgb_u8": latest_geometry["source_rgb_u8"],
         }
+        _camera_profile_event(
+            "profile_camera_keyframe_geometry_total",
+            profile_total_start,
+            chunk_index=chunk_index,
+            keyframes=num_keyframes,
+        )
+        return result
 
     def ensure_valid_depth_geometry(
         self,
@@ -1583,14 +2367,24 @@ class Pi3XWarpRenderer:
                 fill_stats = []
                 mesh_depth_map = current_geometry["depth_map"]
 
+            effective_mesh_break_mode = current_mesh_break_mode
+            if (
+                not use_top_fill
+                and str(current_mesh_break_mode or "none") == "depth_normal"
+                and bool(current_geometry.get("valid_mask_prefiltered_depth_normal", False))
+            ):
+                effective_mesh_break_mode = "none"
             mesh_valid_mask, mesh_break_stats = _apply_mesh_break(
                 point_map_world=augmented_points,
                 depth_map=mesh_depth_map,
                 valid_mask=augmented_valid_mask,
-                mode=current_mesh_break_mode,
+                mode=effective_mesh_break_mode,
                 depth_rtol=float(self.config.mesh_depth_rtol),
                 normal_tol_deg=float(self.config.mesh_normal_tol_deg),
             )
+            if effective_mesh_break_mode != current_mesh_break_mode:
+                mesh_break_stats["requested_mode"] = str(current_mesh_break_mode or "none")
+                mesh_break_stats["prefiltered_depth_normal"] = True
             mesh_break_stats["fill_pixels"] = int(np.asarray(fill_mask, dtype=bool).sum())
             mesh_break_stats["fill_stats"] = fill_stats
             mesh_break_stats["geometry_backend"] = str(current_geometry.get("geometry_backend", "pi3x"))
@@ -1646,10 +2440,13 @@ class Pi3XWarpRenderer:
         target_fill_radius: int | None = None,
         target_fill_min_neighbors: int | None = None,
         mesh_break_mode: str | None = None,
+        return_source_xy: bool = False,
     ) -> dict[str, Any]:
+        profile_total_start = time.perf_counter()
         device = torch.device(device or "cpu")
         render_height = int(geometry["render_height"])
         render_width = int(geometry["render_width"])
+        profile_start = time.perf_counter()
         relative_target_poses = as_pose4x4(target_relative_poses).cpu().numpy().astype(np.float32, copy=False)
 
         if target_intrinsics is None:
@@ -1702,10 +2499,65 @@ class Pi3XWarpRenderer:
             }
             if render_intrinsics_np.shape[0] > 1:
                 geometry["target_intrinsics_stats"]["first_target"] = _intrinsic_stats(render_intrinsics_np[1])
+        _camera_profile_event(
+            "profile_camera_render_pose_intrinsics",
+            profile_start,
+            chunk_index=chunk_index,
+            frames=int(relative_target_poses.shape[0]),
+            keyframes=0 if geometry.get("keyframe_geometries") is None else len(geometry.get("keyframe_geometries")),
+        )
 
-        background_atlas = _build_keyframe_background_atlas(list(keyframe_geometries)) if keyframe_geometries is not None else None
+        profile_start = time.perf_counter()
+        source_pose = np.asarray(geometry["source_pose"], dtype=np.float32)
+        target_poses_world = np.einsum("ij,tjk->tik", source_pose, relative_target_poses)
+        _camera_profile_event(
+            "profile_camera_render_target_poses",
+            profile_start,
+            chunk_index=chunk_index,
+            frames=int(relative_target_poses.shape[0]),
+        )
 
+        keyframe_selection_stats: dict[str, Any] | None = None
+        if keyframe_geometries is not None:
+            profile_start = time.perf_counter()
+            keyframe_geometries, keyframe_selection_stats = _select_visible_keyframe_geometries(
+                list(keyframe_geometries),
+                target_poses_world,
+                render_intrinsics_np,
+                render_height,
+                render_width,
+            )
+            _camera_profile_event(
+                "profile_camera_render_keyframe_select",
+                profile_start,
+                chunk_index=chunk_index,
+                input_keyframes=int(keyframe_selection_stats.get("input_keyframes", len(keyframe_geometries))),
+                kept_keyframes=int(keyframe_selection_stats.get("kept_keyframes", len(keyframe_geometries))),
+            )
+
+        profile_start = time.perf_counter()
+        if keyframe_geometries is not None and device.type == "cuda":
+            background_atlas = _build_keyframe_background_atlas_torch(
+                list(keyframe_geometries),
+                device=device,
+                chunk_index=chunk_index,
+            )
+        elif keyframe_geometries is not None:
+            background_atlas = _build_keyframe_background_atlas(list(keyframe_geometries), chunk_index=chunk_index)
+        else:
+            background_atlas = None
+        _camera_profile_event(
+            "profile_camera_render_background_atlas_build",
+            profile_start,
+            chunk_index=chunk_index,
+            keyframes=0 if keyframe_geometries is None else len(keyframe_geometries),
+            enabled=background_atlas is not None,
+        )
+
+        profile_start = time.perf_counter()
         mesh_break_stats_list: list[dict[str, Any]] = []
+        sampled_mesh_cache_hits = 0
+        sampled_mesh_cache_misses = 0
         if keyframe_geometries is not None:
             sampled_points_parts: list[np.ndarray] = []
             sampled_color_parts: list[np.ndarray] = []
@@ -1719,19 +2571,49 @@ class Pi3XWarpRenderer:
                     else int(CAMERA_CONTROL_PI3X_KEYFRAME_PREVIOUS_MESH_SAMPLES_PER_AXIS)
                 )
                 use_top_fill = bool(is_latest_keyframe and background_atlas is None)
-                try:
-                    (keyframe_points, keyframe_colors, keyframe_source_xy), mesh_break_stats, _ = (
-                        self._sample_geometry_mesh_with_retry(
-                            keyframe_geometry,
-                            str(mesh_break_mode or self.config.mesh_break_mode),
-                            samples_per_axis=samples_per_axis,
-                            use_top_fill=use_top_fill,
+                mesh_cache_key = (
+                    int(samples_per_axis),
+                    bool(use_top_fill),
+                    str(mesh_break_mode or self.config.mesh_break_mode),
+                    float(self.config.conf_threshold),
+                    float(self.config.mesh_depth_rtol),
+                    float(self.config.mesh_normal_tol_deg),
+                )
+                cached_sample = keyframe_geometry.get("_sampled_mesh_cache")
+                if (
+                    isinstance(cached_sample, dict)
+                    and cached_sample.get("key") == mesh_cache_key
+                    and "points" in cached_sample
+                    and "colors" in cached_sample
+                    and "source_xy" in cached_sample
+                ):
+                    sampled_mesh_cache_hits += 1
+                    keyframe_points = cached_sample["points"]
+                    keyframe_colors = cached_sample["colors"]
+                    keyframe_source_xy = cached_sample["source_xy"]
+                    mesh_break_stats = dict(cached_sample.get("mesh_break_stats", {}))
+                else:
+                    sampled_mesh_cache_misses += 1
+                    try:
+                        (keyframe_points, keyframe_colors, keyframe_source_xy), mesh_break_stats, _ = (
+                            self._sample_geometry_mesh_with_retry(
+                                keyframe_geometry,
+                                str(mesh_break_mode or self.config.mesh_break_mode),
+                                samples_per_axis=samples_per_axis,
+                                use_top_fill=use_top_fill,
+                            )
                         )
-                    )
-                except ValueError as exc:
-                    if is_latest_keyframe or "No valid first-frame mesh quads" not in str(exc):
-                        raise
-                    continue
+                    except ValueError as exc:
+                        if is_latest_keyframe or "No valid first-frame mesh quads" not in str(exc):
+                            raise
+                        continue
+                    keyframe_geometry["_sampled_mesh_cache"] = {
+                        "colors": keyframe_colors,
+                        "key": mesh_cache_key,
+                        "mesh_break_stats": dict(mesh_break_stats),
+                        "points": keyframe_points,
+                        "source_xy": keyframe_source_xy,
+                    }
                 mesh_break_stats["keyframe_index"] = int(keyframe_index)
                 mesh_break_stats["keyframe_count"] = int(keyframe_count)
                 mesh_break_stats["samples_per_axis"] = int(samples_per_axis)
@@ -1758,9 +2640,43 @@ class Pi3XWarpRenderer:
             mesh_break_stats["samples_per_axis"] = int(self.config.mesh_samples_per_axis)
             mesh_break_stats["use_top_fill"] = True
             mesh_break_stats_list.append(dict(mesh_break_stats))
+        _camera_profile_event(
+            "profile_camera_render_mesh_sampling",
+            profile_start,
+            chunk_index=chunk_index,
+            keyframes=0 if keyframe_geometries is None else len(keyframe_geometries),
+            sampled_points=int(np.asarray(sampled_points_world).shape[0]),
+            cache_hits=int(sampled_mesh_cache_hits),
+            cache_misses=int(sampled_mesh_cache_misses),
+        )
 
-        source_pose = np.asarray(geometry["source_pose"], dtype=np.float32)
-        target_poses_world = np.einsum("ij,tjk->tik", source_pose, relative_target_poses)
+        if keyframe_geometries is not None:
+            profile_start = time.perf_counter()
+            sampled_points_world, sampled_colors_u8, sampled_source_xy, view_cull_stats = (
+                _cull_sampled_points_to_future_views(
+                    sampled_points_world,
+                    sampled_colors_u8,
+                    sampled_source_xy,
+                    target_poses_world,
+                    render_intrinsics_np,
+                    render_height,
+                    render_width,
+                )
+            )
+            _camera_profile_event(
+                "profile_camera_render_sampled_point_cull",
+                profile_start,
+                chunk_index=chunk_index,
+                input_points=int(view_cull_stats.get("input_points", 0)),
+                kept_points=int(view_cull_stats.get("kept_points", 0)),
+            )
+        else:
+            view_cull_stats = {
+                "enabled": False,
+                "input_points": int(np.asarray(sampled_points_world).shape[0]),
+                "kept_points": int(np.asarray(sampled_points_world).shape[0]),
+                "reason": "single_geometry_fast_path",
+            }
         if invisible_fill_mode == "mean_first_frame":
             invisible_fill_rgb = np.rint(geometry["source_rgb_u8"].reshape(-1, 3).mean(axis=0)).astype(np.uint8)
         elif invisible_fill_mode == "black":
@@ -1773,20 +2689,34 @@ class Pi3XWarpRenderer:
 
         background_frames_uint8: list[np.ndarray] | None = None
         background_valid_frames: list[np.ndarray] | None = None
+        background_frames01_t: torch.Tensor | None = None
+        background_valid_t: torch.Tensor | None = None
         if background_atlas is not None:
-            background_frames_uint8 = []
-            background_valid_frames = []
-            for frame_idx in range(relative_target_poses.shape[0]):
-                background_frame, background_valid = _render_background_atlas(
+            profile_start = time.perf_counter()
+            if device.type == "cuda":
+                background_frames01_t, background_valid_t = _render_background_atlas_torch(
                     background_atlas,
-                    target_poses_world[frame_idx],
-                    render_intrinsics_np[frame_idx],
+                    torch.from_numpy(target_poses_world).to(device=device, dtype=torch.float32),
+                    torch.from_numpy(render_intrinsics_np).to(device=device, dtype=torch.float32),
+                    render_height,
+                    render_width,
+                    torch.from_numpy(invisible_fill_rgb).to(device=device, dtype=torch.float32) / 255.0,
+                )
+            else:
+                background_frames_uint8, background_valid_frames = _render_background_atlas_batch(
+                    background_atlas,
+                    target_poses_world,
+                    render_intrinsics_np,
                     render_height,
                     render_width,
                     invisible_fill_rgb,
                 )
-                background_frames_uint8.append(background_frame)
-                background_valid_frames.append(background_valid)
+            _camera_profile_event(
+                "profile_camera_render_background_atlas_render",
+                profile_start,
+                chunk_index=chunk_index,
+                frames=int(relative_target_poses.shape[0]),
+            )
 
         warp_render_mode = str(render_mode or self.config.render_mode)
         if warp_render_mode not in CAMERA_CONTROL_WARP_RENDER_MODES:
@@ -1803,27 +2733,32 @@ class Pi3XWarpRenderer:
         warp_render_stats: dict[str, Any] = {
             "frame_count": int(relative_target_poses.shape[0]),
             "mode": warp_render_mode,
+            "sampled_mesh_cache_hits": int(sampled_mesh_cache_hits),
+            "sampled_mesh_cache_misses": int(sampled_mesh_cache_misses),
             "target_fill_min_neighbors": int(fill_min_neighbors),
             "target_fill_radius": int(fill_radius),
+            "view_cull": view_cull_stats,
         }
+        if keyframe_selection_stats is not None:
+            warp_render_stats["keyframe_selection"] = keyframe_selection_stats
         if background_atlas is not None:
             warp_render_stats["background_atlas"] = background_atlas["stats"]
 
         if device.type == "cuda":
+            profile_start = time.perf_counter()
             sampled_points_world_t = torch.from_numpy(sampled_points_world).to(device=device, dtype=torch.float32)
             sampled_colors01_t = torch.from_numpy(sampled_colors_u8).to(device=device, dtype=torch.float32) / 255.0
             sampled_source_xy_t = None
             source_rgb01_t = None
-            if target_fill_enabled:
+            if target_fill_enabled or bool(return_source_xy):
                 sampled_source_xy_t = torch.from_numpy(sampled_source_xy).to(device=device, dtype=torch.float32)
+            if target_fill_enabled:
                 source_rgb01_t = (
                     torch.from_numpy(geometry["source_rgb_u8"]).to(device=device, dtype=torch.float32) / 255.0
                 )
             target_poses_world_t = torch.from_numpy(target_poses_world).to(device=device, dtype=torch.float32)
             render_intrinsics_t = torch.from_numpy(render_intrinsics_np).to(device=device, dtype=torch.float32)
             fill_rgb01_t = torch.from_numpy(invisible_fill_rgb).to(device=device, dtype=torch.float32) / 255.0
-            background_frames01_t = None
-            background_valid_t = None
             if background_frames_uint8 is not None and background_valid_frames is not None:
                 background_frames01_t = (
                     torch.from_numpy(np.stack(background_frames_uint8, axis=0)).to(device=device, dtype=torch.float32)
@@ -1833,15 +2768,33 @@ class Pi3XWarpRenderer:
                     device=device,
                     dtype=torch.bool,
                 )
+            _camera_profile_event(
+                "profile_camera_render_cpu_to_gpu",
+                profile_start,
+                chunk_index=chunk_index,
+                sampled_points=int(np.asarray(sampled_points_world).shape[0]),
+                background_atlas=background_atlas is not None,
+            )
+            profile_start = time.perf_counter()
             warp_frames01: list[torch.Tensor] = [
                 torch.from_numpy(geometry["source_rgb_u8"]).to(device=device, dtype=torch.float32) / 255.0
             ]
             visibility_frames_t: list[torch.Tensor] = [
                 torch.ones((render_height, render_width), device=device, dtype=torch.float32)
             ]
-            target_fill_counts_t: list[torch.Tensor] = []
+            source_xy_frames_t: list[torch.Tensor] | None = None
+            if bool(return_source_xy):
+                ys, xs = torch.meshgrid(
+                    torch.arange(render_height, device=device, dtype=torch.float32),
+                    torch.arange(render_width, device=device, dtype=torch.float32),
+                    indexing="ij",
+                )
+                source_xy_frames_t = [torch.stack([xs, ys], dim=-1)]
+            future_frames_t: list[torch.Tensor] = []
+            future_visible_t: list[torch.Tensor] = []
+            future_source_xy_t: list[torch.Tensor | None] = []
             for frame_idx in range(1, relative_target_poses.shape[0]):
-                if target_fill_enabled:
+                if target_fill_enabled or bool(return_source_xy):
                     frame, visible, source_xy_frame = _splat_mesh_samples_to_view_torch(
                         sampled_points_world_t,
                         sampled_colors01_t,
@@ -1853,15 +2806,6 @@ class Pi3XWarpRenderer:
                         source_xy=sampled_source_xy_t,
                         return_source_xy=True,
                     )
-                    frame, visible, fill_mask = _target_fill_from_source_xy_torch(
-                        frame,
-                        visible,
-                        source_xy_frame,
-                        source_rgb01_t,
-                        fill_radius,
-                        fill_min_neighbors,
-                    )
-                    target_fill_counts_t.append(fill_mask.sum().to(dtype=torch.float32))
                 else:
                     frame, visible = _splat_mesh_samples_to_view_torch(
                         sampled_points_world_t,
@@ -1872,21 +2816,55 @@ class Pi3XWarpRenderer:
                         render_width,
                         fill_rgb01_t,
                     )
-                visible = visible.to(dtype=torch.bool)
-                if background_frames01_t is not None and background_valid_t is not None:
-                    frame = torch.where(visible[..., None], frame, background_frames01_t[frame_idx])
-                    visible = visible | background_valid_t[frame_idx]
-                warp_frames01.append(frame)
-                visibility_frames_t.append(visible.to(dtype=torch.float32))
+                    source_xy_frame = None
+                future_frames_t.append(frame)
+                future_visible_t.append(visible.to(dtype=torch.bool))
+                future_source_xy_t.append(source_xy_frame)
 
-            if target_fill_counts_t:
-                target_fill_counts = torch.stack(target_fill_counts_t)
+            target_fill_counts = None
+            if future_frames_t:
+                future_frames = torch.stack(future_frames_t, dim=0)
+                future_visible = torch.stack(future_visible_t, dim=0)
+                if target_fill_enabled:
+                    source_xy_stack = torch.stack([xy for xy in future_source_xy_t if xy is not None], dim=0)
+                    future_frames, future_visible, fill_mask = _target_fill_from_source_xy_torch_batch(
+                        future_frames,
+                        future_visible,
+                        source_xy_stack,
+                        source_rgb01_t,
+                        fill_radius,
+                        fill_min_neighbors,
+                    )
+                    target_fill_counts = fill_mask.sum(dim=(1, 2)).to(dtype=torch.float32)
+                for future_idx in range(int(future_frames.shape[0])):
+                    frame_idx = future_idx + 1
+                    frame = future_frames[future_idx]
+                    visible = future_visible[future_idx]
+                    visible = visible.to(dtype=torch.bool)
+                    if background_frames01_t is not None and background_valid_t is not None:
+                        frame = torch.where(visible[..., None], frame, background_frames01_t[frame_idx])
+                        visible = visible | background_valid_t[frame_idx]
+                    warp_frames01.append(frame)
+                    visibility_frames_t.append(visible.to(dtype=torch.float32))
+                    if source_xy_frames_t is not None:
+                        source_xy_frames_t.append(future_source_xy_t[future_idx])
+            _camera_profile_event(
+                "profile_camera_render_splat_target_fill",
+                profile_start,
+                chunk_index=chunk_index,
+                frames=int(relative_target_poses.shape[0]),
+                sampled_points=int(np.asarray(sampled_points_world).shape[0]),
+                target_fill=bool(target_fill_enabled),
+            )
+
+            profile_start = time.perf_counter()
+            if target_fill_counts is not None:
                 warp_render_stats["target_fill_pixels"] = int(target_fill_counts.sum().detach().cpu().item())
                 warp_render_stats["target_fill_mean_pixels_per_frame"] = float(
                     target_fill_counts.mean().detach().cpu().item()
                 )
             visibility_frames = torch.stack(visibility_frames_t, dim=0)
-            return {
+            result = {
                 "geometry": geometry,
                 "mesh_break_stats": mesh_break_stats_list,
                 "visibility_frames": visibility_frames,
@@ -1894,9 +2872,29 @@ class Pi3XWarpRenderer:
                 "warp_video": _frames01_to_video_tensor(torch.stack(warp_frames01, dim=0), height=height, width=width),
                 "warp_visibility_mask": _visibility_frames_to_tensor(visibility_frames, height=height, width=width),
             }
+            if source_xy_frames_t is not None:
+                result["warp_source_xy"] = torch.stack(source_xy_frames_t, dim=0)
+            _camera_profile_event(
+                "profile_camera_render_stack_resize",
+                profile_start,
+                chunk_index=chunk_index,
+                frames=int(relative_target_poses.shape[0]),
+            )
+            _camera_profile_event(
+                "profile_camera_render_from_geometry_total",
+                profile_total_start,
+                chunk_index=chunk_index,
+                frames=int(relative_target_poses.shape[0]),
+                keyframes=0 if keyframe_geometries is None else len(keyframe_geometries),
+            )
+            return result
 
         warp_frames_uint8: list[np.ndarray] = [geometry["source_rgb_u8"]]
         visibility_frames_np: list[np.ndarray] = [np.ones((render_height, render_width), dtype=np.float32)]
+        source_xy_frames_np: list[np.ndarray] | None = None
+        if bool(return_source_xy):
+            ys, xs = np.mgrid[0:render_height, 0:render_width].astype(np.float32)
+            source_xy_frames_np = [np.stack([xs, ys], axis=-1)]
         target_fill_pixels = 0
         for frame_idx in range(1, relative_target_poses.shape[0]):
             if target_fill_enabled:
@@ -1920,14 +2918,27 @@ class Pi3XWarpRenderer:
                 )
                 target_fill_pixels += int(fill_count)
             else:
-                frame, visible = _splat_mesh_samples_to_view_fast(
-                    sampled_points_world,
-                    sampled_colors_u8,
-                    target_poses_world[frame_idx],
-                    render_intrinsics_np[frame_idx],
-                    render_height,
-                    render_width,
-                )
+                if bool(return_source_xy):
+                    frame, visible, source_xy_frame = _splat_mesh_samples_to_view_fast(
+                        sampled_points_world,
+                        sampled_colors_u8,
+                        target_poses_world[frame_idx],
+                        render_intrinsics_np[frame_idx],
+                        render_height,
+                        render_width,
+                        source_xy=sampled_source_xy,
+                        return_source_xy=True,
+                    )
+                else:
+                    frame, visible = _splat_mesh_samples_to_view_fast(
+                        sampled_points_world,
+                        sampled_colors_u8,
+                        target_poses_world[frame_idx],
+                        render_intrinsics_np[frame_idx],
+                        render_height,
+                        render_width,
+                    )
+                    source_xy_frame = None
             if background_frames_uint8 is not None and background_valid_frames is not None:
                 background_frame = background_frames_uint8[frame_idx]
                 background_valid = background_valid_frames[frame_idx]
@@ -1937,13 +2948,15 @@ class Pi3XWarpRenderer:
                 frame[~visible] = invisible_fill_rgb
             warp_frames_uint8.append(frame)
             visibility_frames_np.append(visible.astype(np.float32, copy=False))
+            if source_xy_frames_np is not None:
+                source_xy_frames_np.append(source_xy_frame.astype(np.float32, copy=False))
 
         if target_fill_enabled:
             warp_render_stats["target_fill_pixels"] = int(target_fill_pixels)
             warp_render_stats["target_fill_mean_pixels_per_frame"] = float(
                 target_fill_pixels / max(int(relative_target_poses.shape[0]) - 1, 1)
             )
-        return {
+        result = {
             "geometry": geometry,
             "mesh_break_stats": mesh_break_stats_list,
             "visibility_frames": visibility_frames_np,
@@ -1951,6 +2964,9 @@ class Pi3XWarpRenderer:
             "warp_video": _frames_uint8_to_video_tensor(warp_frames_uint8, height=height, width=width),
             "warp_visibility_mask": _visibility_frames_to_tensor(visibility_frames_np, height=height, width=width),
         }
+        if source_xy_frames_np is not None:
+            result["warp_source_xy"] = np.stack(source_xy_frames_np, axis=0)
+        return result
 
     def render(
         self,

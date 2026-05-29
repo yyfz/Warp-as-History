@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
+import os
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -34,6 +37,7 @@ from .camera_warp import (
     CAMERA_CONTROL_DEFAULT_WARP_RENDER_MODE,
     CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_MIN_NEIGHBORS,
     CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_RADIUS,
+    CAMERA_CONTROL_PI3X_KEYFRAME_RENDER_MAX_PREVIOUS,
     CAMERA_CONTROL_PROMPT_TRIGGER,
     Pi3XWarpRenderer,
     Pi3XWarpRendererConfig,
@@ -56,6 +60,22 @@ from .defaults import (
 
 
 LORA_AUTO_VALUES = frozenset({"auto", "default"})
+
+
+def _wah_profile_enabled() -> bool:
+    return os.environ.get("WAH_PROFILE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _wah_sync_cuda() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _wah_profile_event(event: str, start: float, **payload: Any) -> None:
+    if not _wah_profile_enabled():
+        return
+    _wah_sync_cuda()
+    print(json.dumps({"event": event, "seconds": round(time.perf_counter() - start, 6), **payload}), flush=True)
 
 
 if XLA_AVAILABLE:
@@ -663,18 +683,31 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 and pi3x_keyframe_images is not None
                 and len(pi3x_keyframe_images) > 1
             ):
+                max_keyframes_for_geometry = max(int(CAMERA_CONTROL_PI3X_KEYFRAME_RENDER_MAX_PREVIOUS) + 1, 1)
+                selected_pi3x_keyframe_images = list(pi3x_keyframe_images)
+                if len(selected_pi3x_keyframe_images) > max_keyframes_for_geometry:
+                    selected_pi3x_keyframe_images = selected_pi3x_keyframe_images[-max_keyframes_for_geometry:]
                 geometry = state["camera_renderer"].estimate_keyframe_geometry(
-                    image_tensors=list(pi3x_keyframe_images),
+                    image_tensors=selected_pi3x_keyframe_images,
                     device=device,
                     scale_reference_geometry=state.get("camera_first_frame_geometry"),
+                    chunk_index=int(chunk_index),
                 )
                 state.setdefault("pi3x_keyframe_counts", []).append(int(geometry["keyframe_count"]))
+                state.setdefault("pi3x_keyframe_memory_selection_stats", []).append(
+                    {
+                        "available_keyframes": int(len(pi3x_keyframe_images)),
+                        "selected_keyframes": int(len(selected_pi3x_keyframe_images)),
+                        "policy": "most_recent_visible_window",
+                    }
+                )
                 state.setdefault("pi3x_keyframe_scale_alignment_stats", []).append(
                     geometry.get("scale_alignment_stats", {})
                 )
                 state.setdefault("pi3x_keyframe_intrinsic_smoothing_stats", []).append(
                     geometry.get("intrinsic_smoothing_stats", {})
                 )
+            profile_render_start = time.perf_counter()
             rendered = state["camera_renderer"].render(
                 image_tensor=source_frame.to(device=device, dtype=torch.float32),
                 camera_poses=camera_poses,
@@ -692,6 +725,13 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 target_fill_radius=int(state["camera_control_warp_target_fill_radius"]),
                 target_fill_min_neighbors=int(state["camera_control_warp_target_fill_min_neighbors"]),
                 mesh_break_mode=str(state["camera_control_mesh_break_mode"]),
+            )
+            _wah_profile_event(
+                "profile_wah_camera_warp_render_chunk",
+                profile_render_start,
+                chunk_index=int(chunk_index),
+                frame_count=int(frame_count),
+                cached=False,
             )
 
         if int(chunk_index) == 0:
