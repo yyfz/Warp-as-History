@@ -232,6 +232,22 @@ python scripts/web_control.py \
   --port 7860
 ```
 
+For the minimal efficient realtime web demo, download the efficient checkpoint
+to `checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt`
+and start the same UI with the fast preset:
+
+```bash
+python scripts/web_control.py \
+  --host 0.0.0.0 \
+  --port 7860 \
+  --efficient_realtime_fast \
+  --enable_optional_attention
+```
+
+`--efficient_realtime_fast` switches the web UI to `patch_mid`, uses
+`[1, 1, 1]` inference steps, disables first-chunk amplification, and enables the
+realtime camera warp preset.
+
 Open the printed URL, upload a first frame, enter a prompt, select translation
 and rotation buttons, then click Generate. The server keeps the autoregressive
 state alive between Generate clicks. Generated mp4 files are written under `runs/web_control` by default. 
@@ -310,6 +326,24 @@ realtime warp preset: `target_fill`, `camera_pi3_pixel_limit=130000`, and
 `camera_mesh_samples_per_axis=2`. Efficient `patch_mid` inference enables this
 preset by default; use `--no_camera_realtime_fast_warp` for the original
 high-quality camera warp defaults, or override the individual values explicitly.
+
+For lower-latency realtime preview/display, TAEHV is optional. Without a TAEHV
+checkpoint the original VAE path is unchanged. To enable it, download `taehv.py`
+and the Wan 2.1 / Qwen Image style checkpoint:
+
+```bash
+mkdir -p checkpoints/taehv
+wget -O checkpoints/taehv/taehv.py \
+  https://raw.githubusercontent.com/madebyollin/taehv/main/taehv.py
+wget -O checkpoints/taehv/taew2_1.pth \
+  https://github.com/madebyollin/taehv/raw/main/taew2_1.pth
+export PYTHONPATH=$PWD/checkpoints/taehv:$PYTHONPATH
+```
+
+Then append `--taehv_checkpoint checkpoints/taehv/taew2_1.pth` to the efficient
+realtime inference or web command. Supplying a checkpoint defaults to
+`--taehv_vae_mode full`; pass `--taehv_vae_mode decode` to keep the original VAE
+for input encoding and use TAEHV only for display decoding.
 
 ## GPU memory
 

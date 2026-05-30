@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -113,6 +114,21 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional directory where the pipeline writes warp.mp4 for the warp conditioning debug view.",
+    )
+    parser.add_argument(
+        "--taehv_vae_mode",
+        choices=["off", "decode", "full"],
+        default=None,
+        help=(
+            "Optional TAEHV preview VAE mode. Defaults to off, or full when "
+            "--taehv_checkpoint is provided. decode/full use TAEHV for faster display decoding."
+        ),
+    )
+    parser.add_argument(
+        "--taehv_checkpoint",
+        type=Path,
+        default=None,
+        help="Path to a TAEHV checkpoint such as taew2_1.pth. Required unless --taehv_vae_mode off.",
     )
     parser.add_argument(
         "--enable_optional_attention",
@@ -308,6 +324,47 @@ def resolve_lora_path(lora_path: str | Path | None) -> str | None:
     return str(path)
 
 
+def resolve_taehv_vae_mode_arg(mode: str | None, checkpoint: str | Path | None) -> str:
+    if mode is not None:
+        return str(mode).strip().lower()
+    if checkpoint is not None and str(checkpoint).strip():
+        return "full"
+    return "off"
+
+
+def validate_taehv_checkpoint_arg(mode: str, checkpoint: str | Path | None) -> Path | None:
+    mode = str(mode or "off").strip().lower()
+    if mode == "off":
+        return None
+    if checkpoint is None or not str(checkpoint).strip():
+        raise ValueError(
+            "TAEHV VAE mode is enabled but --taehv_checkpoint was not provided. "
+            "Download taew2_1.pth from https://github.com/madebyollin/taehv and pass "
+            "--taehv_checkpoint /path/to/taew2_1.pth."
+        )
+    checkpoint_path = Path(checkpoint).expanduser()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Missing TAEHV checkpoint: {checkpoint_path}. Download it with:\n"
+            "  mkdir -p checkpoints/taehv\n"
+            "  wget -O checkpoints/taehv/taew2_1.pth "
+            "https://github.com/madebyollin/taehv/raw/main/taew2_1.pth\n"
+            "Then pass --taehv_checkpoint checkpoints/taehv/taew2_1.pth."
+        )
+    return checkpoint_path
+
+
+def validate_taehv_import_arg(mode: str) -> None:
+    if str(mode or "off").strip().lower() == "off":
+        return
+    if importlib.util.find_spec("taehv") is None:
+        raise ImportError(
+            "TAEHV VAE was requested, but Python module 'taehv' is not importable. "
+            "Install the TAEHV repository or put its taehv.py on PYTHONPATH, then retry. "
+            "Repository: https://github.com/madebyollin/taehv."
+        )
+
+
 def disable_diffusers_optional_attention() -> None:
     try:
         import diffusers.utils.import_utils as diffusers_import_utils
@@ -339,6 +396,14 @@ def disable_diffusers_optional_attention() -> None:
 
 def main() -> None:
     args = parse_args()
+    taehv_vae_mode = resolve_taehv_vae_mode_arg(args.taehv_vae_mode, args.taehv_checkpoint)
+    taehv_checkpoint = args.taehv_checkpoint
+    if taehv_vae_mode != "off":
+        try:
+            taehv_checkpoint = validate_taehv_checkpoint_arg(taehv_vae_mode, args.taehv_checkpoint)
+            validate_taehv_import_arg(taehv_vae_mode)
+        except Exception as exc:
+            raise SystemExit(str(exc)) from exc
     if not args.enable_optional_attention:
         disable_diffusers_optional_attention()
 
@@ -389,6 +454,11 @@ def main() -> None:
     model_path = resolve_model_path(args.model_path)
     lora_path = None if args.no_lora else resolve_lora_path(args.lora_path)
     pipe = WarpAsHistoryPipeline.from_pretrained(model_path, torch_dtype=dtype).to(device)
+    if taehv_vae_mode != "off":
+        try:
+            pipe.install_taehv_vae(mode=taehv_vae_mode, checkpoint=taehv_checkpoint)
+        except Exception as exc:
+            raise SystemExit(str(exc)) from exc
     if args.camera_realtime_fast_warp is None:
         use_realtime_fast_warp = str(args.warp_history_downsample_mode) == "patch_mid"
     else:
@@ -454,6 +524,8 @@ def main() -> None:
                 "camera_warp_render_mode": camera_warp_render_mode,
                 "camera_pi3_pixel_limit": max(int(camera_pi3_pixel_limit), 1),
                 "camera_mesh_samples_per_axis": max(int(camera_mesh_samples_per_axis), 1),
+                "taehv_vae_mode": taehv_vae_mode,
+                "taehv_checkpoint": str(taehv_checkpoint) if taehv_checkpoint is not None else None,
                 "pyramid_num_inference_steps_list": args.pyramid_num_inference_steps_list,
                 "amplify_first_chunk": bool(args.amplify_first_chunk),
                 "frames": len(frames),

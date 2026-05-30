@@ -10,6 +10,7 @@ import math
 import sys
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -28,15 +29,27 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.infer_warp_as_history import (  # noqa: E402
+    DEFAULT_CAMERA_MESH_SAMPLES_PER_AXIS,
+    DEFAULT_CAMERA_PI3_PIXEL_LIMIT,
+    DEFAULT_CAMERA_WARP_RENDER_MODE,
     DEFAULT_MODEL,
     DEFAULT_WAH_LORA,
+    REALTIME_CAMERA_MESH_SAMPLES_PER_AXIS,
+    REALTIME_CAMERA_PI3_PIXEL_LIMIT,
+    REALTIME_CAMERA_WARP_RENDER_MODE,
     disable_diffusers_optional_attention,
     frame_to_uint8,
     resolve_lora_path,
     resolve_model_path,
     torch_dtype_from_arg,
     unwrap_video_frames,
+    resolve_taehv_vae_mode_arg,
+    validate_taehv_checkpoint_arg,
+    validate_taehv_import_arg,
 )
+
+
+DEFAULT_EFFICIENT_WAH_LORA = "checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt"
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,6 +67,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto")
     parser.add_argument("--output_dir", type=Path, default=REPO_ROOT / "runs" / "web_control")
     parser.add_argument("--preload", action="store_true", help="Load the model before serving requests.")
+    parser.add_argument(
+        "--efficient_realtime_fast",
+        action="store_true",
+        help=(
+            "Use the efficient realtime web preset: patch_mid history, [1, 1, 1] "
+            "inference steps, no first-chunk amplification, target_fill camera warp, "
+            "pi3_pixel_limit=130000, and mesh_samples_per_axis=2."
+        ),
+    )
+    parser.add_argument(
+        "--taehv_vae_mode",
+        choices=["off", "decode", "full"],
+        default=None,
+        help=(
+            "Optional TAEHV preview VAE mode. Defaults to off, or full when "
+            "--taehv_checkpoint is provided. decode/full use TAEHV for faster display decoding."
+        ),
+    )
+    parser.add_argument(
+        "--taehv_checkpoint",
+        type=Path,
+        default=None,
+        help="Path to a TAEHV checkpoint such as taew2_1.pth. Required unless --taehv_vae_mode off.",
+    )
     parser.add_argument(
         "--enable_optional_attention",
         action="store_true",
@@ -198,6 +235,15 @@ class AppConfig:
     device: str
     dtype: str
     output_dir: Path
+    efficient_realtime_fast: bool = False
+    warp_history_downsample_mode: str = "short"
+    pyramid_num_inference_steps_list: tuple[int, int, int] | None = None
+    amplify_first_chunk: bool = True
+    camera_warp_render_mode: str = DEFAULT_CAMERA_WARP_RENDER_MODE
+    camera_pi3_pixel_limit: int = DEFAULT_CAMERA_PI3_PIXEL_LIMIT
+    camera_mesh_samples_per_axis: int = DEFAULT_CAMERA_MESH_SAMPLES_PER_AXIS
+    taehv_vae_mode: str = "off"
+    taehv_checkpoint: Path | None = None
 
 
 @dataclass
@@ -229,6 +275,11 @@ class WarpControlApp:
 
         dtype = torch_dtype_from_arg(self.config.dtype, self.config.device)
         pipe = WarpAsHistoryPipeline.from_pretrained(self.config.model_path, torch_dtype=dtype).to(self.config.device)
+        if str(self.config.taehv_vae_mode) != "off":
+            pipe.install_taehv_vae(
+                mode=str(self.config.taehv_vae_mode),
+                checkpoint=self.config.taehv_checkpoint,
+            )
         self.state.pipe = pipe
         return pipe
 
@@ -277,6 +328,14 @@ class WarpControlApp:
             generator=self._new_generator(),
             output_type="np",
             camera_control_translation_scale=float(translation_scale),
+            warp_history_downsample_mode=str(self.config.warp_history_downsample_mode),
+            pyramid_num_inference_steps_list=list(self.config.pyramid_num_inference_steps_list)
+            if self.config.pyramid_num_inference_steps_list is not None
+            else None,
+            is_amplify_first_chunk=bool(self.config.amplify_first_chunk),
+            camera_control_warp_render_mode=str(self.config.camera_warp_render_mode),
+            camera_control_pi3_pixel_limit=max(int(self.config.camera_pi3_pixel_limit), 1),
+            camera_control_mesh_samples_per_axis=max(int(self.config.camera_mesh_samples_per_axis), 1),
         )
         self.state.wah_state = state
         self.state.window_num_frames = int(state["window_num_frames"])
@@ -339,7 +398,6 @@ class WarpControlApp:
         debug_warp: bool,
     ) -> dict[str, Any]:
         with self.lock:
-            pipe = self.load_pipeline()
             if reset:
                 self.reset()
             if self.state.wah_state is None:
@@ -347,6 +405,8 @@ class WarpControlApp:
                     raise ValueError("Upload a first frame before the first generation.")
                 if not prompt.strip():
                     raise ValueError("Prompt is required before the first generation.")
+            pipe = self.load_pipeline()
+            if self.state.wah_state is None:
                 self._init_generation(
                     pipe=pipe,
                     prompt=prompt.strip(),
@@ -675,7 +735,7 @@ HTML_PAGE = """<!doctype html>
       <label for="firstFrame">First Frame</label>
       <input id="firstFrame" type="file" accept="image/*" />
       <label for="prompt">Prompt</label>
-      <textarea id="prompt" spellcheck="false"></textarea>
+      <textarea id="prompt" spellcheck="false">Generate a realistic scene with camera movement.</textarea>
       <button id="debugWarp" class="secondary" type="button">Debug Warp</button>
       <button id="generate" class="primary">Generate</button>
       <button id="reset" class="secondary danger">Reset State</button>
@@ -997,6 +1057,7 @@ def make_handler(app: WarpControlApp):
                 )
                 _json_response(self, payload)
             except Exception as exc:
+                traceback.print_exc()
                 _json_response(
                     self,
                     {"ok": False, "error": html.escape(str(exc))},
@@ -1008,11 +1069,23 @@ def make_handler(app: WarpControlApp):
 
 def main() -> None:
     args = parse_args()
+    use_fast = bool(args.efficient_realtime_fast)
+    lora_path = args.lora_path
+    if use_fast and not args.no_lora and str(lora_path) == DEFAULT_WAH_LORA:
+        lora_path = DEFAULT_EFFICIENT_WAH_LORA
+    taehv_vae_mode = resolve_taehv_vae_mode_arg(args.taehv_vae_mode, args.taehv_checkpoint)
+    taehv_checkpoint = args.taehv_checkpoint
+    if taehv_vae_mode != "off":
+        try:
+            taehv_checkpoint = validate_taehv_checkpoint_arg(taehv_vae_mode, args.taehv_checkpoint)
+            validate_taehv_import_arg(taehv_vae_mode)
+        except Exception as exc:
+            raise SystemExit(str(exc)) from exc
     if not args.enable_optional_attention:
         disable_diffusers_optional_attention()
     config = AppConfig(
         model_path=resolve_model_path(args.model_path),
-        lora_path=None if args.no_lora else resolve_lora_path(args.lora_path),
+        lora_path=None if args.no_lora else resolve_lora_path(lora_path),
         height=int(args.height),
         width=int(args.width),
         fps=int(args.fps),
@@ -1020,6 +1093,17 @@ def main() -> None:
         device=str(args.device),
         dtype=str(args.dtype),
         output_dir=args.output_dir.expanduser().resolve(),
+        efficient_realtime_fast=use_fast,
+        warp_history_downsample_mode="patch_mid" if use_fast else "short",
+        pyramid_num_inference_steps_list=(1, 1, 1) if use_fast else None,
+        amplify_first_chunk=not use_fast,
+        camera_warp_render_mode=REALTIME_CAMERA_WARP_RENDER_MODE if use_fast else DEFAULT_CAMERA_WARP_RENDER_MODE,
+        camera_pi3_pixel_limit=REALTIME_CAMERA_PI3_PIXEL_LIMIT if use_fast else DEFAULT_CAMERA_PI3_PIXEL_LIMIT,
+        camera_mesh_samples_per_axis=REALTIME_CAMERA_MESH_SAMPLES_PER_AXIS
+        if use_fast
+        else DEFAULT_CAMERA_MESH_SAMPLES_PER_AXIS,
+        taehv_vae_mode=taehv_vae_mode,
+        taehv_checkpoint=taehv_checkpoint.expanduser().resolve() if taehv_checkpoint is not None else None,
     )
     app = WarpControlApp(config)
     if args.preload:
@@ -1032,6 +1116,18 @@ def main() -> None:
                 "url": f"http://{args.host}:{args.port}",
                 "output_dir": str(config.output_dir),
                 "model_path": config.model_path,
+                "lora_path": config.lora_path,
+                "efficient_realtime_fast": bool(config.efficient_realtime_fast),
+                "warp_history_downsample_mode": config.warp_history_downsample_mode,
+                "pyramid_num_inference_steps_list": list(config.pyramid_num_inference_steps_list)
+                if config.pyramid_num_inference_steps_list is not None
+                else None,
+                "amplify_first_chunk": bool(config.amplify_first_chunk),
+                "camera_warp_render_mode": config.camera_warp_render_mode,
+                "camera_pi3_pixel_limit": int(config.camera_pi3_pixel_limit),
+                "camera_mesh_samples_per_axis": int(config.camera_mesh_samples_per_axis),
+                "taehv_vae_mode": config.taehv_vae_mode,
+                "taehv_checkpoint": str(config.taehv_checkpoint) if config.taehv_checkpoint is not None else None,
             },
             ensure_ascii=False,
         ),

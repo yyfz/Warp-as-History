@@ -360,6 +360,79 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         ).to(device, self.vae.dtype)
         return latents_mean, latents_std
 
+    def install_taehv_vae(
+        self,
+        *,
+        mode: str = "off",
+        checkpoint: str | Path | None = None,
+        parallel: bool = True,
+    ) -> "WarpAsHistoryPipeline":
+        """Install optional TAEHV preview decoding.
+
+        mode="decode" keeps the original VAE for image/video encoding and uses
+        TAEHV only for autoregressive display decoding. mode="full" replaces
+        the active VAE wrapper, so both encode and decode use TAEHV.
+        """
+        mode = str(mode or "off").strip().lower()
+        if mode == "off":
+            original_vae = getattr(self, "_wah_original_vae", None)
+            if original_vae is not None and getattr(self, "_wah_taehv_vae_mode", "off") == "full":
+                self.vae = original_vae
+            self._wah_taehv_decoder = None
+            self._wah_taehv_vae_mode = "off"
+            self._wah_taehv_checkpoint = None
+            return self
+
+        from .taehv_preview import create_taehv_preview_backend
+
+        if not hasattr(self, "_wah_original_vae"):
+            self._wah_original_vae = self.vae
+        original_vae = self._wah_original_vae
+        backend = create_taehv_preview_backend(
+            mode=mode,
+            checkpoint=checkpoint,
+            device=self._execution_device,
+            dtype=original_vae.dtype,
+            parallel=parallel,
+        )
+        if backend is None:
+            return self.install_taehv_vae(mode="off")
+
+        if mode == "full":
+            self.vae = backend.vae
+            self._wah_taehv_decoder = None
+        else:
+            self.vae = original_vae
+            self._wah_taehv_decoder = backend.decoder
+        self._wah_taehv_vae_mode = mode
+        self._wah_taehv_checkpoint = str(backend.checkpoint)
+        print(
+            json.dumps(
+                {
+                    "event": "taehv_vae_installed",
+                    "mode": mode,
+                    "checkpoint": str(backend.checkpoint),
+                    "parallel": bool(parallel),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return self
+
+    def _decode_autoregressive_latents(
+        self,
+        *,
+        diffusion_latents: torch.Tensor,
+        vae_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        taehv_decoder = getattr(self, "_wah_taehv_decoder", None)
+        if taehv_decoder is not None:
+            return taehv_decoder.decode_diffusion_latents(
+                diffusion_latents.to(device=self._execution_device, dtype=taehv_decoder.dtype)
+            )
+        return self.vae.decode(vae_latents, return_dict=False)[0]
+
     @staticmethod
     def _slice_frame_sequence(
         value: torch.Tensor | np.ndarray | None,
@@ -1870,11 +1943,12 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         vae_dtype = self.vae.dtype
         latents_mean = state["latents_mean"].to(device=device, dtype=vae_dtype)
         latents_std = state["latents_std"].to(device=device, dtype=vae_dtype)
-        current_latents = (
-            real_history_latents[:, :, -WAH_NUM_LATENT_FRAMES_PER_CHUNK:].to(vae_dtype) / latents_std
-            + latents_mean
+        diffusion_latents = real_history_latents[:, :, -WAH_NUM_LATENT_FRAMES_PER_CHUNK:]
+        current_latents = diffusion_latents.to(vae_dtype) / latents_std + latents_mean
+        current_video = self._decode_autoregressive_latents(
+            diffusion_latents=diffusion_latents,
+            vae_latents=current_latents,
         )
-        current_video = self.vae.decode(current_latents, return_dict=False)[0]
         self._record_decoded_chunk_boundary(state, current_video)
         self._commit_autoregressive_conditioning(state)
 
