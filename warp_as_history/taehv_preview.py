@@ -37,13 +37,15 @@ class TAEHVDiffusersWrapper(nn.Module):
     so this wrapper only handles layout/range adaptation.
     """
 
-    def __init__(self, taehv: nn.Module, *, parallel: bool = True):
+    def __init__(self, taehv: nn.Module, *, parallel: bool = True, reference_config: Any | None = None):
         super().__init__()
         self.taehv = taehv
         self.parallel = bool(parallel)
         latent_channels = int(getattr(taehv, "latent_channels", 16))
-        scale_factor_temporal = int(getattr(taehv, "t_upscale", 4))
-        scale_factor_spatial = 8 * int(getattr(taehv, "patch_size", 1))
+        scale_factor_temporal = int(getattr(reference_config, "scale_factor_temporal", getattr(taehv, "t_upscale", 4)))
+        scale_factor_spatial = int(
+            getattr(reference_config, "scale_factor_spatial", 8 * int(getattr(taehv, "patch_size", 1)))
+        )
         self.config = _DotConfig(
             z_dim=latent_channels,
             latents_mean=[0.0] * latent_channels,
@@ -60,10 +62,12 @@ class TAEHVDiffusersWrapper(nn.Module):
         if video.ndim != 5:
             raise ValueError(f"Expected NCTHW video tensor, got {tuple(video.shape)}")
         video_ntchw = video.to(dtype=self.dtype).permute(0, 2, 1, 3, 4).div(2.0).add(0.5).clamp_(0.0, 1.0)
+        pad = int(getattr(self.taehv, "frames_to_trim", 3))
+        if pad > 0:
+            video_ntchw = torch.cat([video_ntchw[:, :1].expand(-1, pad, -1, -1, -1), video_ntchw], dim=1)
         latents_ntchw = self.taehv.encode_video(
             video_ntchw,
             parallel=self.parallel,
-            show_progress_bar=False,
         )
         latents = latents_ntchw.permute(0, 2, 1, 3, 4)
         return _EncoderOutput(latents)
@@ -75,8 +79,10 @@ class TAEHVDiffusersWrapper(nn.Module):
         video_ntchw = self.taehv.decode_video(
             latents_ntchw,
             parallel=self.parallel,
-            show_progress_bar=False,
         )
+        trim = int(getattr(self.taehv, "frames_to_trim", 3))
+        if trim > 0 and video_ntchw.shape[1] > trim:
+            video_ntchw = video_ntchw[:, trim:]
         return video_ntchw.permute(0, 2, 1, 3, 4).mul(2.0).sub(1.0)
 
     def decode(self, latents: torch.Tensor, return_dict: bool | None = None) -> tuple[torch.Tensor]:
@@ -133,6 +139,7 @@ def create_taehv_preview_backend(
     checkpoint: str | Path | None,
     device: torch.device | str,
     dtype: torch.dtype,
+    reference_config: Any | None = None,
     parallel: bool = True,
 ) -> TAEHVPreviewBackend | None:
     mode = str(mode or "off").strip().lower()
@@ -153,5 +160,5 @@ def create_taehv_preview_backend(
     return TAEHVPreviewBackend(
         mode=mode,
         checkpoint=checkpoint_path.resolve(),
-        vae=TAEHVDiffusersWrapper(taehv, parallel=parallel),
+        vae=TAEHVDiffusersWrapper(taehv, parallel=parallel, reference_config=reference_config),
     )

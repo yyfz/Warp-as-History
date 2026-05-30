@@ -393,6 +393,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             checkpoint=checkpoint,
             device=self._execution_device,
             dtype=original_vae.dtype,
+            reference_config=original_vae.config,
             parallel=parallel,
         )
         if backend is None:

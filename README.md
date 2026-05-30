@@ -23,7 +23,7 @@
 </div>
 
 <div align="center">
-This repository provides the official implementation of Warp-as-History. Our method enables interactive camera trajectory following and viewpoint manipulation, similar to HappyOyster and Genie 3, using only a single camera-annotated training example.
+This repository provides the official implementation of Warp-as-History. Our method enables realtime interactive camera trajectory following and viewpoint manipulation, similar to HappyOyster and Genie 3, using only a single camera-annotated training example.
 </div>
 
 
@@ -71,7 +71,7 @@ your environment.
 - Helios-Distilled (default): [`BestWishYsh/Helios-Distilled`](https://huggingface.co/BestWishYsh/Helios-Distilled/tree/main)
 - Pi3X: [`yyfz233/Pi3X`](https://huggingface.co/yyfz233/Pi3X)
 - Warp-as-History LoRA (default): [`yyfz233/warp-as-history`](https://huggingface.co/yyfz233/warp-as-history)
-- Warp-as-History efficient patch-mid LoRA (optional): [`visible_lora_state_step1000_efficient_patchmid.pt`](https://huggingface.co/yyfz233/warp-as-history/blob/main/visible_lora_state_step1000_efficient_patchmid.pt)
+- Warp-as-History efficient realtime LoRA (optional): [`visible_lora_state_step1000_efficient_patchmid.pt`](https://huggingface.co/yyfz233/warp-as-history/blob/main/visible_lora_state_step1000_efficient_patchmid.pt)
 - Helios-Mid (optional, training only): [`BestWishYsh/Helios-Mid`](https://huggingface.co/BestWishYsh/Helios-Mid)
 
 Download the required models once before inference or training:
@@ -86,7 +86,7 @@ huggingface-cli download yyfz233/Pi3X model.safetensors \
 huggingface-cli download yyfz233/warp-as-history visible_lora_state_step1000.safetensors \
   --local-dir checkpoints/warp-as-history
 
-# optional: released efficient patch-mid LoRA for efficient inference
+# optional: released efficient realtime LoRA
 huggingface-cli download yyfz233/warp-as-history visible_lora_state_step1000_efficient_patchmid.pt \
   --local-dir checkpoints/warp-as-history
 
@@ -224,69 +224,48 @@ including that boundary pose explicitly. For pre-rendered warp conditioning,
 initialize with `conditioning_type="warp"` and pass exactly `window` warp frames
 per call via `warp_video` and optionally `warp_visibility_mask`.
 
-An interactive browser UI is available for prompt-and-button camera control:
+### Web realtime demo
+
+An interactive browser UI is available for prompt-and-button camera control.
+The web demo has two presets: `normal` keeps the standard, higher-quality
+Warp-as-History recipe, while `efficient_realtime` switches to the low-latency
+realtime recipe.
 
 ```bash
-python scripts/web_control.py \
+python scripts/web_realtime_demo.py \
+  --preset normal \
   --host 0.0.0.0 \
   --port 7860
 ```
 
-For the minimal efficient realtime web demo, download the efficient checkpoint
-to `checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt`
-and start the same UI with the fast preset:
-
 ```bash
-python scripts/web_control.py \
+python scripts/web_realtime_demo.py \
+  --preset efficient_realtime \
   --host 0.0.0.0 \
-  --port 7860 \
-  --efficient_realtime_fast \
-  --enable_optional_attention
+  --port 7860
 ```
 
-`--efficient_realtime_fast` switches the web UI to `patch_mid`, uses
-`[1, 1, 1]` inference steps, disables first-chunk amplification, and enables the
-realtime camera warp preset.
+`normal` uses the standard Warp-as-History inference recipe and is the
+recommended browser mode when quality matters more than latency.
+`efficient_realtime` uses the released efficient LoRA at
+`checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt`
+and matches the realtime web preset: `patch_mid`, `[1, 1, 1]` inference steps,
+no first-chunk amplification, `matmul_precision=high`, disabled progress bars,
+visible-token threshold `0.6`, `target_fill` camera warp, `camera_pi3_pixel_limit=130000`,
+`camera_mesh_samples_per_axis=2`, full TAEHV VAE from `checkpoints/taehv/taew2_1.pth`,
+official kernels, optional attention, and pipeline preload.
 
 Open the printed URL, upload a first frame, enter a prompt, select translation
-and rotation buttons, then click Generate. The server keeps the autoregressive
-state alive between Generate clicks. Generated mp4 files are written under `runs/web_control` by default. 
+and rotation buttons, then click Start. The server keeps the autoregressive
+state alive between Start clicks. Generated mp4 files are written under
+`runs/web_realtime_demo` or `runs/web_realtime_demo_efficient_realtime` by default.
 
 <img src="assets/webcontrol_demo.gif" alt="WebControl demo" width="100%">
 
-## Training
+## Realtime / H200 deployment
 
-Preview sampled training batches:
-
-```bash
-python scripts/dryrun_online_warp_batch.py
-```
-
-Train:
-
-```bash
-python scripts/train_warp_as_history_lora.py \
-  --prompt_csv data/training/training_data.csv \
-  --data_root data/training \
-  --output_dir runs/warp_as_history_lora \
-  --max_steps 1000 \
-  --save_every 1000 \
-  --log_every 10 \
-  --overwrite
-```
-
-To train the optional efficient LoRA, add `--warp_history_downsample_mode patch_mid`.
-Use that LoRA for efficient inference by passing the same mode, for example
-`python scripts/infer_warp_as_history.py demo.csv --lora_path runs/warp_as_history_lora_efficient/visible_lora_state.pt --warp_history_downsample_mode patch_mid`.
-You can also download the released efficient checkpoint
-`visible_lora_state_step1000_efficient_patchmid.pt` from
-[`yyfz233/warp-as-history`](https://huggingface.co/yyfz233/warp-as-history/blob/main/visible_lora_state_step1000_efficient_patchmid.pt)
-and pass it as `--lora_path checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt`.
-
-The training script writes `train_config.json`, `train_loss.json`,
-`visible_lora_state.pt`, and step checkpoints when `--save_every` is enabled.
-
-### H200 realtime recipe
+This section targets the low-latency `efficient_realtime` path. For the
+higher-quality browser demo, use `--preset normal` as shown above.
 
 For realtime H200 deployment, first follow the upstream Helios performance
 setup and verify that the base Helios pipeline reaches about 20 FPS in your
@@ -294,21 +273,32 @@ environment. Use the FlashAttention 3 kernel recommended by the Helios
 repository for Hopper/H200-class GPUs, set the pyramid inference steps from
 `[2, 2, 2]` to `[1, 1, 1]`, and disable first-chunk amplification.
 
-Train the efficient Warp-as-History LoRA:
+For the `efficient_realtime` web preset, download TAEHV once to the default
+location used by the web demo:
 
 ```bash
-python scripts/train_warp_as_history_lora.py \
-  --prompt_csv data/training/training_data.csv \
-  --data_root data/training \
-  --output_dir runs/warp_as_history_lora_efficient \
-  --max_steps 1000 \
-  --save_every 1000 \
-  --log_every 10 \
-  --warp_history_downsample_mode patch_mid \
-  --overwrite
+mkdir -p checkpoints/taehv
+wget -O checkpoints/taehv/taehv.py \
+  https://raw.githubusercontent.com/madebyollin/taehv/main/taehv.py
+wget -O checkpoints/taehv/taew2_1.pth \
+  https://github.com/madebyollin/taehv/raw/main/taew2_1.pth
+export PYTHONPATH=$PWD/checkpoints/taehv:$PYTHONPATH
 ```
 
-Run efficient realtime inference with the matching LoRA:
+No extra web flags are needed; `--preset efficient_realtime` enables full TAEHV
+VAE automatically. For command-line inference, TAEHV remains optional and can be
+enabled with `--taehv_checkpoint checkpoints/taehv/taew2_1.pth`.
+
+Run the efficient realtime web demo with:
+
+```bash
+python scripts/web_realtime_demo.py \
+  --preset efficient_realtime \
+  --host 0.0.0.0 \
+  --port 7860
+```
+
+Run efficient realtime command-line inference with the matching LoRA:
 
 ```bash
 python scripts/infer_warp_as_history.py data/demo/angel.csv \
@@ -327,23 +317,60 @@ realtime warp preset: `target_fill`, `camera_pi3_pixel_limit=130000`, and
 preset by default; use `--no_camera_realtime_fast_warp` for the original
 high-quality camera warp defaults, or override the individual values explicitly.
 
-For lower-latency realtime preview/display, TAEHV is optional. Without a TAEHV
-checkpoint the original VAE path is unchanged. To enable it, download `taehv.py`
-and the Wan 2.1 / Qwen Image style checkpoint:
+To train a matching efficient LoRA yourself instead of using the released
+checkpoint, see [Train efficient realtime LoRA](#train-efficient-realtime-lora).
+
+## Training
+
+Preview sampled training batches:
 
 ```bash
-mkdir -p checkpoints/taehv
-wget -O checkpoints/taehv/taehv.py \
-  https://raw.githubusercontent.com/madebyollin/taehv/main/taehv.py
-wget -O checkpoints/taehv/taew2_1.pth \
-  https://github.com/madebyollin/taehv/raw/main/taew2_1.pth
-export PYTHONPATH=$PWD/checkpoints/taehv:$PYTHONPATH
+python scripts/dryrun_online_warp_batch.py
 ```
 
-Then append `--taehv_checkpoint checkpoints/taehv/taew2_1.pth` to the efficient
-realtime inference or web command. Supplying a checkpoint defaults to
-`--taehv_vae_mode full`; pass `--taehv_vae_mode decode` to keep the original VAE
-for input encoding and use TAEHV only for display decoding.
+### Train standard LoRA
+
+```bash
+python scripts/train_warp_as_history_lora.py \
+  --prompt_csv data/training/training_data.csv \
+  --data_root data/training \
+  --output_dir runs/warp_as_history_lora \
+  --max_steps 1000 \
+  --save_every 1000 \
+  --log_every 10 \
+  --overwrite
+```
+
+### Train efficient realtime LoRA
+
+Train the optional efficient LoRA with `patch_mid` conditioning:
+
+```bash
+python scripts/train_warp_as_history_lora.py \
+  --prompt_csv data/training/training_data.csv \
+  --data_root data/training \
+  --output_dir runs/warp_as_history_lora_efficient \
+  --max_steps 1000 \
+  --save_every 1000 \
+  --log_every 10 \
+  --warp_history_downsample_mode patch_mid \
+  --overwrite
+```
+
+Use that LoRA for efficient inference by passing the same mode, for example:
+
+```bash
+python scripts/infer_warp_as_history.py demo.csv \
+  --lora_path runs/warp_as_history_lora_efficient/visible_lora_state.pt \
+  --warp_history_downsample_mode patch_mid
+```
+
+You can also download the released efficient checkpoint
+[`visible_lora_state_step1000_efficient_patchmid.pt`](https://huggingface.co/yyfz233/warp-as-history/blob/main/visible_lora_state_step1000_efficient_patchmid.pt)
+and pass it as `--lora_path checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt`.
+
+The training script writes `train_config.json`, `train_loss.json`,
+`visible_lora_state.pt`, and step checkpoints when `--save_every` is enabled.
 
 ## GPU memory
 
