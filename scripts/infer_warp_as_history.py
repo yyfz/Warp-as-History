@@ -17,6 +17,9 @@ from PIL import Image
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+TAEHV_ROOT = REPO_ROOT / "third_party" / "taehv"
+if TAEHV_ROOT.is_dir() and str(TAEHV_ROOT) not in sys.path:
+    sys.path.insert(0, str(TAEHV_ROOT))
 
 DEFAULT_MODEL = "checkpoints/helios-distilled"
 DEFAULT_WAH_LORA = "checkpoints/warp-as-history/visible_lora_state_step1000.safetensors"
@@ -360,7 +363,7 @@ def validate_taehv_import_arg(mode: str) -> None:
     if importlib.util.find_spec("taehv") is None:
         raise ImportError(
             "TAEHV VAE was requested, but Python module 'taehv' is not importable. "
-            "Install the TAEHV repository or put its taehv.py on PYTHONPATH, then retry. "
+            "Use the vendored third_party/taehv module or put taehv.py on PYTHONPATH, then retry. "
             "Repository: https://github.com/madebyollin/taehv."
         )
 

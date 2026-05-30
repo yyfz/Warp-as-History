@@ -103,7 +103,7 @@ class TAEHVPreviewBackend:
 def _taehv_import_error_message(exc: Exception) -> str:
     return (
         "TAEHV VAE was requested, but Python module 'taehv' is not importable. "
-        "Install the TAEHV repository or put its taehv.py on PYTHONPATH, then retry. "
+        "Use the vendored third_party/taehv module or put taehv.py on PYTHONPATH, then retry. "
         "Repository: https://github.com/madebyollin/taehv. "
         f"Original import error: {type(exc).__name__}: {exc}"
     )

@@ -273,16 +273,13 @@ environment. Use the FlashAttention 3 kernel recommended by the Helios
 repository for Hopper/H200-class GPUs, set the pyramid inference steps from
 `[2, 2, 2]` to `[1, 1, 1]`, and disable first-chunk amplification.
 
-For the `efficient_realtime` web preset, download TAEHV once to the default
-location used by the web demo:
+TAEHV code is vendored under `third_party/taehv`. For the `efficient_realtime`
+web preset, download the Wan 2.1 / Qwen Image style TAEHV checkpoint once:
 
 ```bash
 mkdir -p checkpoints/taehv
-wget -O checkpoints/taehv/taehv.py \
-  https://raw.githubusercontent.com/madebyollin/taehv/main/taehv.py
 wget -O checkpoints/taehv/taew2_1.pth \
   https://github.com/madebyollin/taehv/raw/main/taew2_1.pth
-export PYTHONPATH=$PWD/checkpoints/taehv:$PYTHONPATH
 ```
 
 No extra web flags are needed; `--preset efficient_realtime` enables full TAEHV
@@ -414,12 +411,17 @@ excellent open-source video generation model. Warp-as-History is built directly
 on top of Helios, and this work would not be possible without their model,
 codebase, and open research contribution.
 
+We also thank [TAEHV](https://github.com/madebyollin/taehv) for lightweight
+video VAE preview support used by the realtime demo.
+
 ## License
 
 - Helios code and weights follow the upstream Helios license:
   https://github.com/PKU-YuanGroup/Helios
 - Pi3X code and weights follow the upstream Pi3 license:
   https://github.com/yyfz/Pi3
+- TAEHV code is vendored from https://github.com/madebyollin/taehv under the
+  MIT License; see [third_party/taehv/LICENSE](third_party/taehv/LICENSE).
 - Warp-as-History code authored in this repository is licensed under
   Apache-2.0; see [LICENSE](LICENSE).
 - LoRA weights are released under CC BY-NC 4.0 and are strictly
