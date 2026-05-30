@@ -37,6 +37,8 @@ from .camera_warp import (
     CAMERA_CONTROL_DEFAULT_WARP_RENDER_MODE,
     CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_MIN_NEIGHBORS,
     CAMERA_CONTROL_DEFAULT_WARP_TARGET_FILL_RADIUS,
+    CAMERA_CONTROL_MESH_SAMPLES_PER_AXIS,
+    CAMERA_CONTROL_PI3_PIXEL_LIMIT,
     CAMERA_CONTROL_PI3X_KEYFRAME_RENDER_MAX_PREVIOUS,
     CAMERA_CONTROL_PROMPT_TRIGGER,
     Pi3XWarpRenderer,
@@ -913,6 +915,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         camera_control_mesh_break_mode: str,
         camera_control_mesh_depth_rtol: float,
         camera_control_mesh_normal_tol_deg: float,
+        camera_control_pi3_pixel_limit: int,
+        camera_control_mesh_samples_per_axis: int,
     ) -> Pi3XWarpRenderer:
         key = (
             str(camera_control_warp_render_mode),
@@ -921,9 +925,13 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             str(camera_control_mesh_break_mode),
             float(camera_control_mesh_depth_rtol),
             float(camera_control_mesh_normal_tol_deg),
+            int(camera_control_pi3_pixel_limit),
+            int(camera_control_mesh_samples_per_axis),
         )
         if self._camera_warp_renderer is None or self._camera_warp_renderer_key != key:
             config = Pi3XWarpRendererConfig(
+                pi3_pixel_limit=int(camera_control_pi3_pixel_limit),
+                mesh_samples_per_axis=int(camera_control_mesh_samples_per_axis),
                 render_mode=str(camera_control_warp_render_mode),
                 target_fill_radius=int(camera_control_warp_target_fill_radius),
                 target_fill_min_neighbors=int(camera_control_warp_target_fill_min_neighbors),
@@ -1319,6 +1327,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         camera_control_mesh_break_mode: str = CAMERA_CONTROL_DEFAULT_MESH_BREAK_MODE,
         camera_control_mesh_depth_rtol: float = CAMERA_CONTROL_DEFAULT_MESH_DEPTH_RTOL,
         camera_control_mesh_normal_tol_deg: float = CAMERA_CONTROL_DEFAULT_MESH_NORMAL_TOL_DEG,
+        camera_control_pi3_pixel_limit: int = CAMERA_CONTROL_PI3_PIXEL_LIMIT,
+        camera_control_mesh_samples_per_axis: int = CAMERA_CONTROL_MESH_SAMPLES_PER_AXIS,
         camera_control_pi3x_keyframe_memory: bool = CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY,
         return_warp_debug: bool = False,
         warp_debug_dir: str | Path | None = None,
@@ -1572,6 +1582,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                 camera_control_mesh_break_mode=camera_control_mesh_break_mode,
                 camera_control_mesh_depth_rtol=float(camera_control_mesh_depth_rtol),
                 camera_control_mesh_normal_tol_deg=float(camera_control_mesh_normal_tol_deg),
+                camera_control_pi3_pixel_limit=max(int(camera_control_pi3_pixel_limit), 1),
+                camera_control_mesh_samples_per_axis=max(int(camera_control_mesh_samples_per_axis), 1),
             )
             source_image_tensor = image_tensor.to(device=device, dtype=torch.float32)
             state.update(
@@ -1590,6 +1602,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                         camera_control_warp_target_fill_min_neighbors
                     ),
                     "camera_control_mesh_break_mode": str(camera_control_mesh_break_mode),
+                    "camera_control_pi3_pixel_limit": max(int(camera_control_pi3_pixel_limit), 1),
+                    "camera_control_mesh_samples_per_axis": max(int(camera_control_mesh_samples_per_axis), 1),
                     "pi3x_keyframe_images": [source_image_tensor.detach().float().cpu()]
                     if bool(camera_control_pi3x_keyframe_memory)
                     else None,
@@ -2066,6 +2080,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
         camera_control_mesh_break_mode: str = CAMERA_CONTROL_DEFAULT_MESH_BREAK_MODE,
         camera_control_mesh_depth_rtol: float = CAMERA_CONTROL_DEFAULT_MESH_DEPTH_RTOL,
         camera_control_mesh_normal_tol_deg: float = CAMERA_CONTROL_DEFAULT_MESH_NORMAL_TOL_DEG,
+        camera_control_pi3_pixel_limit: int = CAMERA_CONTROL_PI3_PIXEL_LIMIT,
+        camera_control_mesh_samples_per_axis: int = CAMERA_CONTROL_MESH_SAMPLES_PER_AXIS,
         camera_control_pi3x_keyframe_memory: bool = CAMERA_CONTROL_DEFAULT_PI3X_KEYFRAME_MEMORY,
         return_warp_debug: bool = False,
         warp_debug_dir: str | Path | None = None,
@@ -2155,6 +2171,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             camera_control_mesh_break_mode=str(camera_control_mesh_break_mode),
             camera_control_mesh_depth_rtol=float(camera_control_mesh_depth_rtol),
             camera_control_mesh_normal_tol_deg=float(camera_control_mesh_normal_tol_deg),
+            camera_control_pi3_pixel_limit=max(int(camera_control_pi3_pixel_limit), 1),
+            camera_control_mesh_samples_per_axis=max(int(camera_control_mesh_samples_per_axis), 1),
             camera_control_pi3x_keyframe_memory=bool(camera_control_pi3x_keyframe_memory),
             return_warp_debug=bool(return_warp_debug),
             warp_debug_dir=warp_debug_dir,

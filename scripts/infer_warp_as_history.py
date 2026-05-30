@@ -19,6 +19,12 @@ if str(REPO_ROOT) not in sys.path:
 
 DEFAULT_MODEL = "checkpoints/helios-distilled"
 DEFAULT_WAH_LORA = "checkpoints/warp-as-history/visible_lora_state_step1000.safetensors"
+DEFAULT_CAMERA_WARP_RENDER_MODE = "splat"
+DEFAULT_CAMERA_PI3_PIXEL_LIMIT = 255000
+DEFAULT_CAMERA_MESH_SAMPLES_PER_AXIS = 4
+REALTIME_CAMERA_WARP_RENDER_MODE = "target_fill"
+REALTIME_CAMERA_PI3_PIXEL_LIMIT = 130000
+REALTIME_CAMERA_MESH_SAMPLES_PER_AXIS = 2
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +74,39 @@ def parse_args() -> argparse.Namespace:
         choices=["short", "patch_mid"],
         default="short",
         help="Use patch_mid with a LoRA trained using the efficient Warp-as-History recipe.",
+    )
+    parser.add_argument(
+        "--camera_realtime_fast_warp",
+        action="store_true",
+        default=None,
+        help=(
+            "Use lower-quality realtime camera-warp settings. Defaults to on for "
+            "--warp_history_downsample_mode patch_mid and off otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--no_camera_realtime_fast_warp",
+        action="store_false",
+        dest="camera_realtime_fast_warp",
+        help="Disable realtime camera-warp settings even when using patch_mid efficient inference.",
+    )
+    parser.add_argument(
+        "--camera_warp_render_mode",
+        choices=["splat", "target_fill"],
+        default=None,
+        help="Override camera warp render mode. Defaults to splat, or target_fill in realtime fast mode.",
+    )
+    parser.add_argument(
+        "--camera_pi3_pixel_limit",
+        type=int,
+        default=None,
+        help="Override Pi3/render pixel limit for camera warp. Defaults to 255000, or 130000 in realtime fast mode.",
+    )
+    parser.add_argument(
+        "--camera_mesh_samples_per_axis",
+        type=int,
+        default=None,
+        help="Override camera warp mesh samples per depth quad. Defaults to 4, or 2 in realtime fast mode.",
     )
     parser.add_argument(
         "--warp_debug_dir",
@@ -350,6 +389,29 @@ def main() -> None:
     model_path = resolve_model_path(args.model_path)
     lora_path = None if args.no_lora else resolve_lora_path(args.lora_path)
     pipe = WarpAsHistoryPipeline.from_pretrained(model_path, torch_dtype=dtype).to(device)
+    if args.camera_realtime_fast_warp is None:
+        use_realtime_fast_warp = str(args.warp_history_downsample_mode) == "patch_mid"
+    else:
+        use_realtime_fast_warp = bool(args.camera_realtime_fast_warp)
+    camera_warp_render_mode = (
+        str(args.camera_warp_render_mode)
+        if args.camera_warp_render_mode is not None
+        else (REALTIME_CAMERA_WARP_RENDER_MODE if use_realtime_fast_warp else DEFAULT_CAMERA_WARP_RENDER_MODE)
+    )
+    camera_pi3_pixel_limit = (
+        int(args.camera_pi3_pixel_limit)
+        if args.camera_pi3_pixel_limit is not None
+        else (REALTIME_CAMERA_PI3_PIXEL_LIMIT if use_realtime_fast_warp else DEFAULT_CAMERA_PI3_PIXEL_LIMIT)
+    )
+    camera_mesh_samples_per_axis = (
+        int(args.camera_mesh_samples_per_axis)
+        if args.camera_mesh_samples_per_axis is not None
+        else (
+            REALTIME_CAMERA_MESH_SAMPLES_PER_AXIS
+            if use_realtime_fast_warp
+            else DEFAULT_CAMERA_MESH_SAMPLES_PER_AXIS
+        )
+    )
     pipe_kwargs = {
         "prompt": prompt,
         "image": Image.open(image_path).convert("RGB"),
@@ -361,6 +423,9 @@ def main() -> None:
         "output_type": "np",
         "warp_history_downsample_mode": str(args.warp_history_downsample_mode),
         "is_amplify_first_chunk": bool(args.amplify_first_chunk),
+        "camera_control_warp_render_mode": camera_warp_render_mode,
+        "camera_control_pi3_pixel_limit": max(int(camera_pi3_pixel_limit), 1),
+        "camera_control_mesh_samples_per_axis": max(int(camera_mesh_samples_per_axis), 1),
         "warp_debug_dir": args.warp_debug_dir,
         "warp_debug_fps": fps,
     }
@@ -385,6 +450,10 @@ def main() -> None:
                 "output": str(output),
                 "lora_path": lora_path,
                 "warp_history_downsample_mode": str(args.warp_history_downsample_mode),
+                "camera_realtime_fast_warp": bool(use_realtime_fast_warp),
+                "camera_warp_render_mode": camera_warp_render_mode,
+                "camera_pi3_pixel_limit": max(int(camera_pi3_pixel_limit), 1),
+                "camera_mesh_samples_per_axis": max(int(camera_mesh_samples_per_axis), 1),
                 "pyramid_num_inference_steps_list": args.pyramid_num_inference_steps_list,
                 "amplify_first_chunk": bool(args.amplify_first_chunk),
                 "frames": len(frames),

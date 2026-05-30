@@ -299,10 +299,17 @@ python scripts/infer_warp_as_history.py data/demo/angel.csv \
   --output runs/angel_h200_realtime.mp4 \
   --lora_path checkpoints/warp-as-history/visible_lora_state_step1000_efficient_patchmid.pt \
   --warp_history_downsample_mode patch_mid \
+  --camera_realtime_fast_warp \
   --pyramid_num_inference_steps_list 1 1 1 \
   --no_amplify_first_chunk \
   --enable_optional_attention
 ```
+
+`--camera_realtime_fast_warp` switches camera conditioning to the tested
+realtime warp preset: `target_fill`, `camera_pi3_pixel_limit=130000`, and
+`camera_mesh_samples_per_axis=2`. Efficient `patch_mid` inference enables this
+preset by default; use `--no_camera_realtime_fast_warp` for the original
+high-quality camera warp defaults, or override the individual values explicitly.
 
 ## GPU memory
 
